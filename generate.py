@@ -112,7 +112,7 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|smallestScreenSize|screenLayout|uiMode|density"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|smallestScreenSize|screenLayout|density"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
@@ -427,6 +427,8 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(false);
         s.setSupportZoom(false);
         s.setTextZoom(100);
+        // 色の切り替えはアプリ側（ConTodoのテーマ）に任せ、WebViewの自動ダーク化は使わない
+        if (Build.VERSION.SDK_INT >= 29) s.setForceDark(WebSettings.FORCE_DARK_OFF);
         WebView.setWebContentsDebuggingEnabled(true);
 
         web.addJavascriptInterface(new Bridge(), "ConTodoNative");
@@ -892,14 +894,33 @@ w(RES + "/values/colors.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 </resources>
 """)
 
+# WebView は「アプリのテーマが明るいか暗いか」で端末のダークモードを判断する。
+# 明るいテーマ（既定）と、夜用（values-night）の2つを用意して、端末の設定に合わせる。
 w(RES + "/values/styles.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="android:Theme.DeviceDefault.NoActionBar">
+    <style name="AppTheme" parent="android:Theme.DeviceDefault.Light.NoActionBar">
         <item name="android:windowBackground">@color/app_bg</item>
         <item name="android:statusBarColor">@color/app_bg</item>
         <item name="android:navigationBarColor">@color/app_bg</item>
         <item name="android:windowLightStatusBar">true</item>
     </style>
+</resources>
+""")
+
+w(RES + "/values-night/styles.xml", r"""<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/app_bg</item>
+        <item name="android:statusBarColor">@color/app_bg</item>
+        <item name="android:navigationBarColor">@color/app_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
+""")
+
+w(RES + "/values-night/colors.xml", r"""<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="app_bg">#111314</color>
 </resources>
 """)
 
