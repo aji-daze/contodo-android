@@ -47,14 +47,51 @@ jobs:
           set -o pipefail
           gradle --no-daemon assembleRelease 2>&1 | tee build.log
 
-      # 失敗の原因をあとから読めるように、ログを公開しておく
+      # APK の署名・構造を検査する（インストールできない原因の切り分け用）
+      - name: inspect apk
+        if: always()
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          {
+            echo "=== build-tools: $BT ==="
+            echo "=== apksigner verify ==="
+            "$BT/apksigner" verify --verbose --print-certs "$APK" 2>&1 || echo "apksigner exit: $?"
+            echo "=== aapt2 badging ==="
+            "$BT/aapt2" dump badging "$APK" 2>&1 | head -40 || true
+            echo "=== zipalign ==="
+            "$BT/zipalign" -c -v 4 "$APK" 2>&1 | tail -4 || true
+          } 2>&1 | tee -a build.log
+
+      - name: enable kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # 本物のAndroidエミュレータにインストールして起動し、画面を撮る
+      - name: emulator test
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash emu.sh
+
+      # 失敗の原因をあとから読めるように、ログと画面を公開しておく
       - name: publish log
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          files=""
+          for f in build.log emu.log crash.log shot-app.png; do
+            if [ -f "$f" ]; then files="$files $f"; fi
+          done
           gh release delete buildlog --yes --cleanup-tag || true
-          gh release create buildlog build.log --prerelease --title buildlog --notes "build log" || true
+          gh release create buildlog $files --prerelease --title buildlog --notes "build log" || true
 
       - name: publish apk
         if: success()
