@@ -1212,4 +1212,32 @@ except Exception as e:  # ネットワークに失敗したときは無地のア
         f.write(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
 
+# ---------------------------------------------------------------- emulator test
+w("emu.sh", r"""#!/bin/bash
+# エミュレータ上で、インストール → 起動 → 画面撮影 までを試す
+APK=app/build/outputs/apk/release/app-release.apk
+{
+  echo "=== device ==="
+  adb shell getprop ro.build.version.release
+  adb shell getprop ro.build.version.sdk
+  echo "=== install ==="
+  adb install -r "$APK" 2>&1
+  echo "install exit: $?"
+  adb shell pm list packages | grep contodo
+  adb shell dumpsys package app.contodo | grep -E "versionName|versionCode|targetSdk|minSdk|flags=|signatures|Signing" | head -12
+  echo "=== launch ==="
+  adb shell monkey -p app.contodo -c android.intent.category.LAUNCHER 1 2>&1
+} > emu.log 2>&1
+sleep 30
+adb exec-out screencap -p > shot-app.png
+{
+  echo "=== resumed activity ==="
+  adb shell dumpsys activity activities | grep -iE "mResumedActivity|topResumedActivity" | head -3
+  echo "=== widgets registered ==="
+  adb shell dumpsys appwidget | grep -iE "contodo" | head -8
+} >> emu.log 2>&1
+adb logcat -d | grep -iE "AndroidRuntime|FATAL|app\.contodo|ConTodo|chromium.*(ERROR|Uncaught)" | tail -80 > crash.log
+echo "emulator test done"
+""")
+
 print("project written")
