@@ -148,6 +148,54 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
         </receiver>
 
         <receiver
+            android:name=".TimelineWidget"
+            android:exported="true"
+            android:label="ConTodo 今日の流れ">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/timeline_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".TasksWidget"
+            android:exported="true"
+            android:label="ConTodo やること">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/tasks_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".FocusWidget"
+            android:exported="true"
+            android:label="ConTodo 集中">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/focus_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".MoneyWidget"
+            android:exported="true"
+            android:label="ConTodo 家計簿">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/money_widget_info" />
+        </receiver>
+
+        <receiver
             android:name=".AlarmReceiver"
             android:exported="false" />
     </application>
@@ -249,6 +297,14 @@ final class Widgets {
             if (cal.length > 0) CalendarWidget.render(c, m, cal);
             int[] pomo = m.getAppWidgetIds(new ComponentName(c, PomodoroWidget.class));
             if (pomo.length > 0) PomodoroWidget.render(c, m, pomo);
+            int[] tl = m.getAppWidgetIds(new ComponentName(c, TimelineWidget.class));
+            if (tl.length > 0) TimelineWidget.render(c, m, tl);
+            int[] tasks = m.getAppWidgetIds(new ComponentName(c, TasksWidget.class));
+            if (tasks.length > 0) TasksWidget.render(c, m, tasks);
+            int[] focus = m.getAppWidgetIds(new ComponentName(c, FocusWidget.class));
+            if (focus.length > 0) FocusWidget.render(c, m, focus);
+            int[] money = m.getAppWidgetIds(new ComponentName(c, MoneyWidget.class));
+            if (money.length > 0) MoneyWidget.render(c, m, money);
         } catch (Exception e) {
             // ウィジェットの更新に失敗してもアプリは止めない
         }
@@ -397,6 +453,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
@@ -432,6 +490,8 @@ public class MainActivity extends Activity {
         WebView.setWebContentsDebuggingEnabled(true);
 
         web.addJavascriptInterface(new Bridge(), "ConTodoNative");
+        // DESK（/kb-cso/desk/）も同じ WebView で開く。DESK はこの名前で1日の要約を渡してくる
+        web.addJavascriptInterface(new DeskBridge(), "DeskAndroid");
         web.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
@@ -482,7 +542,10 @@ public class MainActivity extends Activity {
         setIntent(i);
         String a = clean(i.getStringExtra("action"));
         if (!a.isEmpty() && web != null) {
-            web.evaluateJavascript("window.__conAction&&window.__conAction('" + a + "')", null);
+            String u = web.getUrl();
+            // DESK を開いているときは ConTodo に戻してから操作する
+            if (u == null || !u.startsWith(BASE)) web.loadUrl(BASE + "?action=" + a);
+            else web.evaluateJavascript("window.__conAction&&window.__conAction('" + a + "')", null);
         }
     }
 
@@ -550,9 +613,21 @@ public class MainActivity extends Activity {
     class Bridge {
         @JavascriptInterface
         public void update(String json) {
-            W.p(MainActivity.this).edit().putString("snap", json).apply();
+            android.content.SharedPreferences.Editor ed = W.p(MainActivity.this).edit().putString("snap", json);
+            try {
+                JSONObject d = new JSONObject(json).optJSONObject("desk");
+                if (d != null) ed.putString("desk", d.toString());
+            } catch (Exception e) {
+                // 要約が読めなくても、ほかのウィジェットは更新する
+            }
+            ed.apply();
             TimerAlarm.sync(MainActivity.this, json);
             Widgets.updateAll(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void saveFile(final String name, final String mime, final String content) {
+            startSave(name, mime, content);
         }
 
         @JavascriptInterface
@@ -585,22 +660,41 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void saveBackup(final String name, final String json) {
-            runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    pendingContent = json;
-                    Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                    i.addCategory(Intent.CATEGORY_OPENABLE);
-                    i.setType("application/json");
-                    i.putExtra(Intent.EXTRA_TITLE, name);
-                    try {
-                        startActivityForResult(i, REQ_SAVE);
-                    } catch (Exception e) {
-                        pendingContent = null;
-                        Toast.makeText(MainActivity.this, "保存先を開けませんでした", Toast.LENGTH_LONG).show();
-                    }
+            startSave(name, "application/json", json);
+        }
+    }
+
+    // 端末の「保存先を選ぶ」画面を開き、選ばれた場所に書き込む（onActivityResult で書く）
+    void startSave(final String name, final String mime, final String content) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                pendingContent = content;
+                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType(mime);
+                i.putExtra(Intent.EXTRA_TITLE, name);
+                try {
+                    startActivityForResult(i, REQ_SAVE);
+                } catch (Exception e) {
+                    pendingContent = null;
+                    Toast.makeText(MainActivity.this, "保存先を開けませんでした", Toast.LENGTH_LONG).show();
                 }
-            });
+            }
+        });
+    }
+
+    // DESK の画面から呼ばれる窓口。window.DeskAndroid として見える
+    class DeskBridge {
+        @JavascriptInterface
+        public void publish(String json) {
+            W.p(MainActivity.this).edit().putString("desk", json).apply();
+            Widgets.updateAll(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public String version() {
+            return "ConTodo " + Build.VERSION.SDK_INT;
         }
     }
 }
@@ -879,12 +973,441 @@ public class PomodoroWidget extends AppWidgetProvider {
 }
 """)
 
+# DESK から移したウィジェット（今日の流れ・やること・集中）と、家計簿のウィジェット。
+# どれも同じ骨組み（widget_card）を使い、見出し・大きな数字・本文・下の一行を出し分ける。
+w(PKG_DIR + "/Card.java", r"""package app.contodo;
+
+import android.content.Context;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
+import android.view.View;
+import android.widget.RemoteViews;
+
+import org.json.JSONObject;
+
+import java.util.Calendar;
+import java.util.Locale;
+
+final class Card {
+    // DESK の半透明ウィジェットの色。壁紙が透ける前提で、白と1色だけに絞る
+    static final int TEXT = 0xFFF3F3F5;
+    static final int SUB = 0xA6F3F3F5;
+    static final int FAINT = 0x66F3F3F5;
+    static final int ACCENT = 0xFFE0A458;
+
+    private Card() { }
+
+    // DESK 用の要約。ConTodo の画面と DESK の画面のどちらからも届く
+    static JSONObject desk(Context c) {
+        try {
+            return new JSONObject(W.p(c).getString("desk", "{}"));
+        } catch (Exception e) {
+            return new JSONObject();
+        }
+    }
+
+    static boolean isToday(long at) {
+        if (at <= 0) return false;
+        Calendar a = Calendar.getInstance();
+        a.setTimeInMillis(at);
+        Calendar n = Calendar.getInstance();
+        return a.get(Calendar.YEAR) == n.get(Calendar.YEAR) && a.get(Calendar.DAY_OF_YEAR) == n.get(Calendar.DAY_OF_YEAR);
+    }
+
+    static int toMin(String hm) {
+        if (hm == null) return 0;
+        String[] p = hm.split(":");
+        try {
+            return Integer.parseInt(p[0].trim()) * 60 + (p.length > 1 ? Integer.parseInt(p[1].trim()) : 0);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    static String hhmm(int min) {
+        return String.format(Locale.US, "%d:%02d", (min / 60) % 24, min % 60);
+    }
+
+    static int nowMin() {
+        Calendar c = Calendar.getInstance();
+        return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE);
+    }
+
+    static String yen(long n) {
+        return (n < 0 ? "−¥" : "¥") + String.format(Locale.JAPAN, "%,d", Math.abs(n));
+    }
+
+    static void color(SpannableStringBuilder sb, int from, int color) {
+        sb.setSpan(new ForegroundColorSpan(color), from, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+
+    static void small(SpannableStringBuilder sb, int from) {
+        sb.setSpan(new RelativeSizeSpan(0.85f), from, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+
+    // 半透明のカード（DESK 由来の3つ）
+    static RemoteViews glass(Context c, String label, String action, int rc) {
+        RemoteViews v = new RemoteViews(c.getPackageName(), R.layout.widget_card);
+        v.setImageViewResource(R.id.bg, R.drawable.w_glass);
+        v.setTextViewText(R.id.w_label, label);
+        v.setTextColor(R.id.w_label, FAINT);
+        v.setTextColor(R.id.w_right, FAINT);
+        v.setTextColor(R.id.w_big, TEXT);
+        v.setTextColor(R.id.w_unit, SUB);
+        v.setTextColor(R.id.w_body, TEXT);
+        v.setTextColor(R.id.w_foot, SUB);
+        v.setViewVisibility(R.id.w_bigrow, View.GONE);
+        v.setOnClickPendingIntent(R.id.root, W.open(c, action, rc));
+        return v;
+    }
+}
+""")
+
+w(PKG_DIR + "/TimelineWidget.java", r"""package app.contodo;
+
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProvider;
+import android.content.Context;
+import android.content.Intent;
+import android.text.SpannableStringBuilder;
+import android.widget.RemoteViews;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.List;
+
+public class TimelineWidget extends AppWidgetProvider {
+    static final String ACT_TICK = "app.contodo.TL_TICK";
+
+    @Override
+    public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        render(c, m, ids);
+    }
+
+    @Override
+    public void onReceive(Context c, Intent i) {
+        if (ACT_TICK.equals(i.getAction())) {
+            Widgets.updateAll(c);
+            return;
+        }
+        super.onReceive(c, i);
+    }
+
+    static void render(Context c, AppWidgetManager m, int[] ids) {
+        if (ids == null || ids.length == 0) return;
+        JSONObject d = Card.desk(c);
+        boolean today = Card.isToday(d.optLong("at", 0));
+        int now = Card.nowMin();
+
+        // [開始, 終了, 題名]
+        List<Object[]> blocks = new ArrayList<>();
+        JSONArray arr = today ? d.optJSONArray("blocks") : null;
+        if (arr != null) {
+            for (int k = 0; k < arr.length(); k++) {
+                JSONObject b = arr.optJSONObject(k);
+                if (b == null) continue;
+                int s = Card.toMin(b.optString("start"));
+                int e = Card.toMin(b.optString("end"));
+                if (e <= s) e += 1440; // 日をまたぐシフト
+                blocks.add(new Object[]{s, e, b.optString("title", "（無題）")});
+            }
+        }
+
+        Object[] cur = null;
+        List<Object[]> next = new ArrayList<>();
+        for (Object[] b : blocks) {
+            int s = (Integer) b[0], e = (Integer) b[1];
+            if (cur == null && s <= now && now < e) cur = b;
+            else if (s > now) next.add(b);
+        }
+
+        Calendar cal = Calendar.getInstance();
+        RemoteViews v = Card.glass(c, "今日の流れ", "desk", 31);
+        v.setTextViewText(R.id.w_right, (cal.get(Calendar.MONTH) + 1) + "/" + cal.get(Calendar.DAY_OF_MONTH)
+                + "（" + "日月火水木金土".charAt(cal.get(Calendar.DAY_OF_WEEK) - 1) + "）");
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        if (d.optLong("at", 0) == 0) {
+            sb.append("アプリを一度開くと、ここに今日の予定が出る。");
+            Card.color(sb, 0, Card.SUB);
+        } else {
+            if (cur != null) {
+                sb.append("● ");
+                Card.color(sb, 0, Card.ACCENT);
+                sb.append((String) cur[2]).append("\n");
+                int a = sb.length();
+                sb.append(Card.hhmm((Integer) cur[0])).append("–").append(Card.hhmm((Integer) cur[1]));
+                Card.color(sb, a, Card.SUB);
+                Card.small(sb, a);
+            } else {
+                int a = sb.length();
+                sb.append("いまは予定なし");
+                Card.color(sb, a, Card.SUB);
+            }
+            for (int k = 0; k < next.size() && k < 3; k++) {
+                sb.append("\n");
+                int a = sb.length();
+                sb.append(Card.hhmm((Integer) next.get(k)[0])).append("  ");
+                Card.color(sb, a, Card.SUB);
+                sb.append((String) next.get(k)[2]);
+            }
+            if (cur == null && next.isEmpty()) {
+                sb.append("\n");
+                int a = sb.length();
+                sb.append("この先の予定もなし");
+                Card.color(sb, a, Card.SUB);
+            }
+        }
+        v.setTextViewText(R.id.w_body, sb);
+
+        JSONObject f = d.optJSONObject("focus");
+        int min = today && f != null ? f.optInt("min") : 0;
+        v.setTextViewText(R.id.w_foot, "集中 " + min + " 分 ・ 残タスク " + d.optInt("remain", 0));
+        m.updateAppWidget(ids, v);
+
+        // 次の区切り（予定の始まり・終わり、または日付が変わる時刻）で描き直す
+        int nextAt = 1440;
+        for (Object[] b : blocks) {
+            int s = (Integer) b[0], e = (Integer) b[1];
+            if (s > now) nextAt = Math.min(nextAt, s);
+            if (e > now) nextAt = Math.min(nextAt, e);
+        }
+        schedule(c, nextAt);
+    }
+
+    private static void schedule(Context c, int atMin) {
+        try {
+            AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Calendar t = Calendar.getInstance();
+            t.set(Calendar.HOUR_OF_DAY, 0);
+            t.set(Calendar.MINUTE, 0);
+            t.set(Calendar.SECOND, 5);
+            t.set(Calendar.MILLISECOND, 0);
+            t.add(Calendar.MINUTE, atMin);
+            Intent i = new Intent(c, TimelineWidget.class);
+            i.setAction(ACT_TICK);
+            PendingIntent pi = PendingIntent.getBroadcast(c, 300, i,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            // 端末を起こさない。画面がついたときに追いつけば足りる
+            am.set(AlarmManager.RTC, t.getTimeInMillis(), pi);
+        } catch (Exception e) {
+            // 予約できなくても30分ごとの更新で追いつく
+        }
+    }
+}
+""")
+
+w(PKG_DIR + "/TasksWidget.java", r"""package app.contodo;
+
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProvider;
+import android.content.Context;
+import android.text.SpannableStringBuilder;
+import android.widget.RemoteViews;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+public class TasksWidget extends AppWidgetProvider {
+    @Override
+    public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        render(c, m, ids);
+    }
+
+    static void render(Context c, AppWidgetManager m, int[] ids) {
+        if (ids == null || ids.length == 0) return;
+        JSONObject d = Card.desk(c);
+        RemoteViews v = Card.glass(c, "やること", "tasks", 32);
+        v.setTextViewText(R.id.w_right, String.valueOf(d.optInt("remain", 0)));
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        JSONArray arr = d.optJSONArray("tasks");
+        if (arr == null || arr.length() == 0) {
+            sb.append(d.optLong("at", 0) == 0 ? "アプリを一度開くと、ここに出る。" : "残っているタスクはない。");
+            Card.color(sb, 0, Card.SUB);
+        } else {
+            int n = Math.min(5, arr.length());
+            for (int k = 0; k < n; k++) {
+                JSONObject t = arr.optJSONObject(k);
+                if (t == null) continue;
+                if (sb.length() > 0) sb.append("\n");
+                int a = sb.length();
+                sb.append("○  ");
+                Card.color(sb, a, Card.SUB);
+                sb.append(t.optString("text"));
+                String step = t.optString("step", "");
+                if (!step.isEmpty()) {
+                    sb.append("\n");
+                    int b = sb.length();
+                    sb.append("    → ").append(step);
+                    Card.color(sb, b, Card.SUB);
+                    Card.small(sb, b);
+                }
+            }
+        }
+        v.setTextViewText(R.id.w_body, sb);
+        v.setTextViewText(R.id.w_foot, "");
+        m.updateAppWidget(ids, v);
+    }
+}
+""")
+
+w(PKG_DIR + "/FocusWidget.java", r"""package app.contodo;
+
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProvider;
+import android.content.Context;
+import android.view.View;
+import android.widget.RemoteViews;
+
+import org.json.JSONObject;
+
+public class FocusWidget extends AppWidgetProvider {
+    @Override
+    public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        render(c, m, ids);
+    }
+
+    static void render(Context c, AppWidgetManager m, int[] ids) {
+        if (ids == null || ids.length == 0) return;
+        JSONObject d = Card.desk(c);
+        boolean today = Card.isToday(d.optLong("at", 0));
+        JSONObject f = d.optJSONObject("focus");
+        int min = today && f != null ? f.optInt("min") : 0;
+        int count = today && f != null ? f.optInt("count") : 0;
+        int streak = f != null ? f.optInt("streak") : 0;
+
+        // タイマーが動いているかは、ConTodo 本体の状態を見る
+        JSONObject t = W.snap(c).optJSONObject("timer");
+        boolean running = t != null && t.optBoolean("running") && t.optLong("endAt", 0) > System.currentTimeMillis();
+
+        RemoteViews v = Card.glass(c, "集中", "timer", 33);
+        v.setTextViewText(R.id.w_right, running ? "進行中" : "");
+        v.setTextColor(R.id.w_right, Card.ACCENT);
+        v.setViewVisibility(R.id.w_bigrow, View.VISIBLE);
+        v.setTextViewText(R.id.w_big, String.valueOf(min));
+        v.setTextViewText(R.id.w_unit, "分");
+        v.setTextViewText(R.id.w_body, "今日 " + count + " 本 ・ 連続 " + streak + " 日");
+        v.setTextColor(R.id.w_body, Card.SUB);
+        v.setTextViewText(R.id.w_foot, "終業 " + Card.hhmm(Card.toMin(d.optString("dayEnd", "18:00"))));
+        m.updateAppWidget(ids, v);
+    }
+}
+""")
+
+w(PKG_DIR + "/MoneyWidget.java", r"""package app.contodo;
+
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProvider;
+import android.content.Context;
+import android.text.SpannableStringBuilder;
+import android.view.View;
+import android.widget.RemoteViews;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.Calendar;
+import java.util.Locale;
+
+// 家計簿：今月の支出、予算の残り、多いカテゴリ。色は ConTodo のテーマに合わせる
+public class MoneyWidget extends AppWidgetProvider {
+    @Override
+    public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        render(c, m, ids);
+    }
+
+    static void render(Context c, AppWidgetManager m, int[] ids) {
+        if (ids == null || ids.length == 0) return;
+        JSONObject snap = W.snap(c);
+        JSONObject th = W.theme(snap);
+        int bg = W.col(th, "bg", 0xFFF5F6F5);
+        int ink = W.col(th, "ink", 0xFF1D2120);
+        int ink2 = W.col(th, "ink2", 0xFF6B716E);
+        int ink3 = W.col(th, "ink3", 0xFFA2A7A4);
+        int accent = W.col(th, "accent", 0xFF2F4B6E);
+        int danger = W.col(th, "sun", 0xFFA5473A);
+
+        Calendar cal = Calendar.getInstance();
+        String ym = String.format(Locale.US, "%04d-%02d", cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1);
+        JSONObject mo = snap.optJSONObject("money");
+        // 月が変わった直後は、アプリを開くまで前の月の数字を出さない
+        if (mo != null && !ym.equals(mo.optString("ym"))) mo = null;
+
+        RemoteViews v = new RemoteViews(c.getPackageName(), R.layout.widget_card);
+        v.setImageViewResource(R.id.bg, R.drawable.w_round);
+        v.setInt(R.id.bg, "setColorFilter", bg);
+        v.setTextViewText(R.id.w_label, (cal.get(Calendar.MONTH) + 1) + "月の支出");
+        v.setTextColor(R.id.w_label, ink3);
+        v.setViewVisibility(R.id.w_bigrow, View.VISIBLE);
+        v.setTextViewText(R.id.w_big, Card.yen(mo != null ? mo.optLong("total") : 0));
+        v.setTextColor(R.id.w_big, ink);
+        v.setTextViewText(R.id.w_unit, "");
+        v.setTextViewText(R.id.w_right, mo != null ? mo.optInt("count") + "件" : "");
+        v.setTextColor(R.id.w_right, ink3);
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        if (mo != null && mo.optLong("budget") > 0) {
+            long left = mo.optLong("left");
+            int a = sb.length();
+            if (left < 0) {
+                sb.append("予算を ").append(Card.yen(-left)).append(" 超えています");
+                Card.color(sb, a, danger);
+            } else {
+                sb.append("残り ").append(Card.yen(left));
+                if (mo.optInt("days") > 0) sb.append(" ・ 1日 ").append(Card.yen(mo.optLong("perDay")));
+                Card.color(sb, a, ink2);
+            }
+        }
+        JSONArray cats = mo != null ? mo.optJSONArray("cats") : null;
+        if (cats != null) {
+            for (int k = 0; k < cats.length(); k++) {
+                JSONArray it = cats.optJSONArray(k);
+                if (it == null) continue;
+                if (sb.length() > 0) sb.append("\n");
+                int a = sb.length();
+                sb.append("● ");
+                Card.color(sb, a, W.parse(it.optString(2), ink2));
+                sb.append(it.optString(0)).append("  ");
+                int b = sb.length();
+                sb.append(Card.yen(it.optLong(1)));
+                Card.color(sb, b, ink2);
+            }
+        }
+        if (sb.length() == 0) {
+            sb.append(mo == null ? "アプリを開くと、今月の支出が出る。" : "今月の記録はまだない。");
+            Card.color(sb, 0, ink3);
+        }
+        v.setTextViewText(R.id.w_body, sb);
+        v.setTextColor(R.id.w_body, ink);
+
+        v.setTextViewText(R.id.w_foot, "＋ 支出を入れる");
+        v.setTextColor(R.id.w_foot, accent);
+        v.setOnClickPendingIntent(R.id.w_foot, W.open(c, "spend", 42));
+        v.setOnClickPendingIntent(R.id.root, W.open(c, "money", 41));
+        m.updateAppWidget(ids, v);
+    }
+}
+""")
+
 # ---------------------------------------------------------------- res
 w(RES + "/values/strings.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ConTodo</string>
     <string name="widget_calendar_desc">月のカレンダーと、今日の予定・シフト</string>
     <string name="widget_pomodoro_desc">ポモドーロのタイマーと、今日の進み具合</string>
+    <string name="widget_timeline_desc">いまの予定と次の予定（半透明）</string>
+    <string name="widget_tasks_desc">残っているタスクと次の一歩（半透明）</string>
+    <string name="widget_focus_desc">今日の集中時間と連続日数（半透明）</string>
+    <string name="widget_money_desc">今月の支出と予算の残り</string>
 </resources>
 """)
 
@@ -938,6 +1461,15 @@ w(RES + "/drawable/w_pill.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 </shape>
 """)
 
+# DESK のウィジェットと同じ、壁紙が透ける半透明のカード
+w(RES + "/drawable/w_glass.xml", r"""<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#99101014" />
+    <corners android:radius="24dp" />
+    <stroke android:width="1dp" android:color="#1FFFFFFF" />
+</shape>
+""")
+
 w(RES + "/drawable/ic_notify.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
@@ -979,6 +1511,118 @@ w(RES + "/xml/pomodoro_widget_info.xml", r"""<?xml version="1.0" encoding="utf-8
     android:targetCellHeight="2"
     android:updatePeriodMillis="1800000"
     android:widgetCategory="home_screen" />
+""")
+
+def widget_info(name, desc, w_dp, h_dp, cw, ch):
+    w(RES + "/xml/%s_widget_info.xml" % name,
+      '<?xml version="1.0" encoding="utf-8"?>\n'
+      '<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"\n'
+      '    android:description="@string/widget_%s_desc"\n'
+      '    android:initialLayout="@layout/widget_card"\n'
+      '    android:minWidth="%ddp"\n'
+      '    android:minHeight="%ddp"\n'
+      '    android:minResizeWidth="110dp"\n'
+      '    android:minResizeHeight="110dp"\n'
+      '    android:resizeMode="horizontal|vertical"\n'
+      '    android:targetCellWidth="%d"\n'
+      '    android:targetCellHeight="%d"\n'
+      '    android:updatePeriodMillis="1800000"\n'
+      '    android:widgetCategory="home_screen" />\n' % (desc, w_dp, h_dp, cw, ch))
+
+
+widget_info("timeline", "timeline", 250, 110, 4, 3)
+widget_info("tasks", "tasks", 180, 110, 3, 3)
+widget_info("focus", "focus", 110, 110, 2, 2)
+widget_info("money", "money", 180, 110, 3, 2)
+
+w(RES + "/layout/widget_card.xml", r"""<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ImageView
+        android:id="@+id/bg"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitXY"
+        android:src="@drawable/w_glass" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/w_label"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:maxLines="1"
+                android:text="ConTodo"
+                android:textSize="10sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/w_right"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:maxLines="1"
+                android:textSize="10sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/w_bigrow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="bottom"
+            android:orientation="horizontal"
+            android:paddingTop="2dp">
+
+            <TextView
+                android:id="@+id/w_big"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-light"
+                android:includeFontPadding="false"
+                android:maxLines="1"
+                android:textSize="32sp" />
+
+            <TextView
+                android:id="@+id/w_unit"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingStart="4dp"
+                android:paddingBottom="4dp"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/w_body"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:lineSpacingMultiplier="1.15"
+            android:paddingTop="6dp"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/w_foot"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:paddingTop="4dp"
+            android:textSize="10.5sp" />
+    </LinearLayout>
+</FrameLayout>
 """)
 
 # カレンダー：6週 x 7日のマスを並べる
