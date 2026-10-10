@@ -102,6 +102,21 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+    <!-- 画面時間を数えるための「使用状況へのアクセス」。ユーザーが端末の設定で許可したときだけ働く -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 画面時間にアプリ名を出すため、ランチャーに出るアプリを見えるようにする -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -196,8 +211,34 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
         </receiver>
 
         <receiver
+            android:name=".DetoxWidget"
+            android:exported="true"
+            android:label="ConTodo 画面時間">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/detox_widget_info" />
+        </receiver>
+
+        <receiver
             android:name=".AlarmReceiver"
             android:exported="false" />
+
+        <receiver
+            android:name=".DetoxReceiver"
+            android:exported="false" />
+
+        <!-- 再起動やアプリの更新のあとに、お知らせの予約をやり直す -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
 """)
@@ -305,6 +346,8 @@ final class Widgets {
             if (focus.length > 0) FocusWidget.render(c, m, focus);
             int[] money = m.getAppWidgetIds(new ComponentName(c, MoneyWidget.class));
             if (money.length > 0) MoneyWidget.render(c, m, money);
+            int[] detox = m.getAppWidgetIds(new ComponentName(c, DetoxWidget.class));
+            if (detox.length > 0) DetoxWidget.render(c, m, detox);
         } catch (Exception e) {
             // ウィジェットの更新に失敗してもアプリは止めない
         }
@@ -362,6 +405,62 @@ final class Notifier {
                     .setDefaults(Notification.DEFAULT_SOUND);
         }
         nm.notify(ID, b.build());
+    }
+
+    // ---- デジタルデトックスのお知らせ ----
+    static final String CH_DETOX = "detox_v1";
+    static final int ID_USAGE = 2;
+    static final int ID_BED = 3;
+    static final int ID_DETOX_END = 4;
+
+    private static void post(Context c, int id, String channel, String name, int importance, boolean vib,
+                             String title, String body, String action, int rc) {
+        NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch = new NotificationChannel(channel, name, importance);
+            if (vib) {
+                ch.enableVibration(true);
+                ch.setVibrationPattern(PATTERN);
+            }
+            nm.createNotificationChannel(ch);
+        }
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(c, channel)
+                : new Notification.Builder(c);
+        b.setSmallIcon(R.drawable.ic_notify)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(new Notification.BigTextStyle().bigText(body))
+                .setAutoCancel(true)
+                .setContentIntent(W.open(c, action, rc));
+        if (Build.VERSION.SDK_INT < 26) {
+            b.setPriority(importance >= NotificationManager.IMPORTANCE_HIGH ? Notification.PRIORITY_HIGH : Notification.PRIORITY_DEFAULT);
+            if (vib) b.setVibrate(PATTERN);
+        }
+        nm.notify(id, b.build());
+    }
+
+    // level 1 = 目標の8割、2 = 目標に到達
+    static void showUsage(Context c, int level, long min, long goal) {
+        String now = Usage.dur(min) + "（目標 " + Usage.dur(goal) + "）";
+        if (level >= 2) {
+            post(c, ID_USAGE, CH_DETOX, "画面時間のお知らせ", NotificationManager.IMPORTANCE_DEFAULT, false,
+                    "今日の画面時間が目標に届きました", now + "。ここで一度、スマホを置いて休みましょう。", "usage", 61);
+        } else {
+            post(c, ID_USAGE, CH_DETOX, "画面時間のお知らせ", NotificationManager.IMPORTANCE_DEFAULT, false,
+                    "画面時間が目標に近づいています", "今日は " + now + "。そろそろ、いったん置きませんか。", "usage", 61);
+        }
+    }
+
+    static void showBedtime(Context c) {
+        post(c, ID_BED, CH_DETOX, "画面時間のお知らせ", NotificationManager.IMPORTANCE_DEFAULT, false,
+                "そろそろスマホを置く時間です", "充電器につないで、枕元から離しましょう。「置く」を始めると、時間を計れます。", "detox", 62);
+    }
+
+    static void showDetoxEnd(Context c, int min) {
+        post(c, ID_DETOX_END, CHANNEL, "タイマー", NotificationManager.IMPORTANCE_HIGH, true,
+                "置けました", (min > 0 ? min + "分、" : "") + "スマホから離れられました。", "detox", 63);
     }
 }
 """)
@@ -530,6 +629,19 @@ public class MainActivity extends Activity {
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
         }
+        handleSelftest(getIntent());
+    }
+
+    // 動作確認用（エミュレータの自動試験だけが使う）。extra「selftest」付きで起動されたときだけ働く
+    private void handleSelftest(Intent i) {
+        if (i == null || !i.hasExtra("selftest")) return;
+        final Context ctx = getApplicationContext();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                Selftest.run(ctx);
+            }
+        }).start();
     }
 
     static String clean(String a) {
@@ -540,6 +652,7 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
         setIntent(i);
+        handleSelftest(i);
         String a = clean(i.getStringExtra("action"));
         if (!a.isEmpty() && web != null) {
             String u = web.getUrl();
@@ -554,7 +667,12 @@ public class MainActivity extends Activity {
         super.onResume();
         foreground = true;
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (nm != null) nm.cancel(Notifier.ID);
+        if (nm != null) {
+            nm.cancel(Notifier.ID);
+            nm.cancel(Notifier.ID_USAGE);
+            nm.cancel(Notifier.ID_BED);
+            nm.cancel(Notifier.ID_DETOX_END);
+        }
     }
 
     @Override
@@ -661,6 +779,66 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void saveBackup(final String name, final String json) {
             startSave(name, "application/json", json);
+        }
+
+        // ---- デジタルデトックス ----
+        @JavascriptInterface
+        public boolean usageAccess() {
+            return Usage.hasAccess(MainActivity.this);
+        }
+
+        // 端末の「使用状況へのアクセス」の設定画面を開く
+        @JavascriptInterface
+        public void usageOpenSettings() {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Intent i = new Intent(android.provider.Settings.ACTION_USAGE_ACCESS_SETTINGS);
+                        if (Build.VERSION.SDK_INT >= 29) i.setData(Uri.parse("package:" + getPackageName()));
+                        startActivity(i);
+                    } catch (Exception e) {
+                        try {
+                            startActivity(new Intent(android.provider.Settings.ACTION_USAGE_ACCESS_SETTINGS));
+                        } catch (Exception e2) {
+                            Toast.makeText(MainActivity.this, "設定を開けませんでした。端末の設定から「使用状況へのアクセス」を開いてください", Toast.LENGTH_LONG).show();
+                        }
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String usageSummary() {
+            try {
+                return Usage.summary(MainActivity.this).toString();
+            } catch (Throwable t) {
+                android.util.Log.e("ConTodo", "usageSummary failed", t);
+                return "{\"ok\":false}";
+            }
+        }
+
+        @JavascriptInterface
+        public int usagePickups(double from, double to) {
+            return Usage.pickups(MainActivity.this, (long) from, (long) to);
+        }
+
+        @JavascriptInterface
+        public void detoxStart(double endAt, double min) {
+            Nudge.sessionStart(MainActivity.this, (long) endAt, (int) min);
+        }
+
+        @JavascriptInterface
+        public void detoxCancel() {
+            Nudge.sessionCancel(MainActivity.this);
+        }
+
+        // 目標・お知らせの設定。変わるたびに予約を付け直す
+        @JavascriptInterface
+        public void detoxConfig(String json) {
+            Nudge.saveConfig(MainActivity.this, json);
+            Nudge.armAll(MainActivity.this);
+            Widgets.updateAll(MainActivity.this);
         }
     }
 
@@ -1398,6 +1576,578 @@ public class MoneyWidget extends AppWidgetProvider {
 }
 """)
 
+# ---------------------------------------------------------------- デジタルデトックス
+# 画面時間は、端末の「使用状況」から端末の中だけで数える（保存も送信もしない）。
+# ユーザーが設定で「使用状況へのアクセス」を許可したときだけ働く。
+w(PKG_DIR + "/Usage.java", r"""package app.contodo;
+
+import android.app.AppOpsManager;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.os.Build;
+import android.os.Process;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+final class Usage {
+    private Usage() { }
+
+    static boolean hasAccess(Context c) {
+        try {
+            AppOpsManager a = (AppOpsManager) c.getSystemService(Context.APP_OPS_SERVICE);
+            if (a == null) return false;
+            int mode = Build.VERSION.SDK_INT >= 29
+                    ? a.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.getPackageName())
+                    : a.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.getPackageName());
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static String dur(long min) {
+        if (min < 60) return min + "分";
+        long h = min / 60;
+        long m = min % 60;
+        return m == 0 ? h + "時間" : h + "時間" + m + "分";
+    }
+
+    static long dayStart(int daysAgo) {
+        Calendar c = Calendar.getInstance();
+        c.set(Calendar.HOUR_OF_DAY, 0);
+        c.set(Calendar.MINUTE, 0);
+        c.set(Calendar.SECOND, 0);
+        c.set(Calendar.MILLISECOND, 0);
+        c.add(Calendar.DAY_OF_MONTH, -daysAgo);
+        return c.getTimeInMillis();
+    }
+
+    static final class Result {
+        long[] starts;
+        long[] perDay;
+        int[] pickups;
+        boolean pickupsOk;
+        Map<String, Long> todayPkg = new HashMap<>();
+
+        long todayMin() {
+            return Math.round(perDay[perDay.length - 1] / 60000.0);
+        }
+    }
+
+    // 画面時間に数えるのは、ランチャーに出る一般のアプリだけ（ホーム画面・システムUI・入力などは除く）
+    private static final class Counter {
+        final PackageManager pm;
+        final String home;
+        final Result r;
+        final Map<String, Boolean> ok = new HashMap<>();
+
+        Counter(PackageManager pm, Result r) {
+            this.pm = pm;
+            this.r = r;
+            this.home = homePackage(pm);
+        }
+
+        boolean counts(String pkg) {
+            Boolean b = ok.get(pkg);
+            if (b != null) return b;
+            boolean v;
+            try {
+                v = !pkg.equals(home) && !pkg.equals("com.android.systemui") && pm.getLaunchIntentForPackage(pkg) != null;
+            } catch (Exception e) {
+                v = false;
+            }
+            ok.put(pkg, v);
+            return v;
+        }
+
+        void add(String pkg, long s, long e) {
+            if (e <= s || !counts(pkg)) return;
+            int n = r.starts.length;
+            for (int i = 0; i < n; i++) {
+                long ds = r.starts[i];
+                long de = i + 1 < n ? r.starts[i + 1] : Long.MAX_VALUE;
+                long a = Math.max(s, ds);
+                long b = Math.min(e, de);
+                if (b > a) {
+                    r.perDay[i] += b - a;
+                    if (i == n - 1) {
+                        Long old = r.todayPkg.get(pkg);
+                        r.todayPkg.put(pkg, (old == null ? 0L : old) + (b - a));
+                    }
+                }
+            }
+        }
+    }
+
+    static String homePackage(PackageManager pm) {
+        try {
+            Intent h = new Intent(Intent.ACTION_MAIN);
+            h.addCategory(Intent.CATEGORY_HOME);
+            ResolveInfo ri = pm.resolveActivity(h, PackageManager.MATCH_DEFAULT_ONLY);
+            if (ri != null && ri.activityInfo != null) return ri.activityInfo.packageName;
+        } catch (Exception e) {
+            // 見つからなければ、ホーム画面の除外はしない
+        }
+        return "";
+    }
+
+    // 直近 days 日（今日を含む）の画面時間を、アプリの「前面にいた時間」から数える
+    static Result compute(Context c, int days) {
+        Result r = new Result();
+        r.starts = new long[days];
+        r.perDay = new long[days];
+        r.pickups = new int[days];
+        r.pickupsOk = Build.VERSION.SDK_INT >= 28;
+        for (int i = 0; i < days; i++) r.starts[i] = dayStart(days - 1 - i);
+        UsageStatsManager usm = (UsageStatsManager) c.getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usm == null) return r;
+        long now = System.currentTimeMillis();
+        // 日付をまたいで前面にいたアプリを拾うため、少し前から読む
+        UsageEvents ev = usm.queryEvents(r.starts[0] - 3L * 3600000L, now);
+        if (ev == null) return r;
+        Counter ct = new Counter(c.getPackageManager(), r);
+        UsageEvents.Event e = new UsageEvents.Event();
+        Map<String, Integer> open = new HashMap<>();
+        Map<String, Long> since = new HashMap<>();
+        while (ev.hasNextEvent()) {
+            ev.getNextEvent(e);
+            int t = e.getEventType();
+            long ts = e.getTimeStamp();
+            String pkg = e.getPackageName();
+            if (t == 1 && pkg != null) {            // アプリが前面に来た
+                Integer n = open.get(pkg);
+                if (n == null || n == 0) {
+                    since.put(pkg, ts);
+                    open.put(pkg, 1);
+                } else {
+                    open.put(pkg, n + 1);
+                }
+            } else if (t == 2 && pkg != null) {     // 前面から外れた
+                Integer n = open.get(pkg);
+                if (n != null && n > 0) {
+                    open.put(pkg, n - 1);
+                    if (n == 1) {
+                        Long s = since.remove(pkg);
+                        if (s != null) ct.add(pkg, s, ts);
+                    }
+                }
+            } else if (t == 16 || t == 17) {        // 画面が消えた・ロックされた
+                for (Map.Entry<String, Long> en : since.entrySet()) ct.add(en.getKey(), en.getValue(), ts);
+                since.clear();
+                open.clear();
+            } else if (t == 15) {                   // 画面がついた
+                for (int i = days - 1; i >= 0; i--) {
+                    if (ts >= r.starts[i]) {
+                        r.pickups[i]++;
+                        break;
+                    }
+                }
+            }
+        }
+        // いま使っているアプリは、いままでの分を数える
+        for (Map.Entry<String, Long> en : since.entrySet()) ct.add(en.getKey(), en.getValue(), now);
+        return r;
+    }
+
+    static long todayMinutes(Context c) {
+        return compute(c, 1).todayMin();
+    }
+
+    // from〜to の間に画面がついた回数。数えられない端末は -1
+    static int pickups(Context c, long from, long to) {
+        if (Build.VERSION.SDK_INT < 28 || !hasAccess(c)) return -1;
+        try {
+            UsageStatsManager usm = (UsageStatsManager) c.getSystemService(Context.USAGE_STATS_SERVICE);
+            if (usm == null || to <= from) return -1;
+            UsageEvents ev = usm.queryEvents(from, to);
+            if (ev == null) return -1;
+            UsageEvents.Event e = new UsageEvents.Event();
+            int n = 0;
+            while (ev.hasNextEvent()) {
+                ev.getNextEvent(e);
+                if (e.getEventType() == 15) n++;
+            }
+            return n;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    static String label(PackageManager pm, String pkg) {
+        try {
+            return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (Exception e) {
+            return pkg;
+        }
+    }
+
+    // 今日よく使ったアプリ（[名前, 分]）
+    static List<Object[]> top(Context c, Result r, int n) {
+        List<Map.Entry<String, Long>> list = new ArrayList<>(r.todayPkg.entrySet());
+        Collections.sort(list, (a, b) -> Long.compare(b.getValue(), a.getValue()));
+        List<Object[]> out = new ArrayList<>();
+        PackageManager pm = c.getPackageManager();
+        for (Map.Entry<String, Long> en : list) {
+            if (out.size() >= n) break;
+            long m = Math.round(en.getValue() / 60000.0);
+            if (m < 1) break;
+            out.add(new Object[]{label(pm, en.getKey()), m});
+        }
+        return out;
+    }
+
+    // ページ（記録タブ）に渡す要約
+    static JSONObject summary(Context c) throws JSONException {
+        Result r = compute(c, 7);
+        int last = r.perDay.length - 1;
+        JSONObject today = new JSONObject();
+        today.put("min", r.todayMin());
+        today.put("pickups", r.pickupsOk ? r.pickups[last] : -1);
+        JSONArray top = new JSONArray();
+        for (Object[] t : top(c, r, 5)) top.put(new JSONArray().put(t[0]).put(t[1]));
+        today.put("top", top);
+        JSONArray days = new JSONArray();
+        for (int i = 0; i <= last; i++) {
+            Calendar d = Calendar.getInstance();
+            d.setTimeInMillis(r.starts[i] + 3600000L);
+            days.put(new JSONObject()
+                    .put("k", W.key(d.get(Calendar.YEAR), d.get(Calendar.MONTH) + 1, d.get(Calendar.DAY_OF_MONTH)))
+                    .put("min", Math.round(r.perDay[i] / 60000.0)));
+        }
+        return new JSONObject().put("ok", true).put("today", today).put("days", days);
+    }
+}
+""")
+
+w(PKG_DIR + "/Nudge.java", r"""package app.contodo;
+
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.os.Build;
+
+import org.json.JSONObject;
+
+import java.util.Calendar;
+
+// 画面時間のお知らせ（目標の8割・到達）、寝る前のお知らせ、「置く」の終わりの通知を、アラームで予約する
+final class Nudge {
+    static final String ACT_CHECK = "app.contodo.DX_CHECK";
+    static final String ACT_BED = "app.contodo.DX_BED";
+    static final String ACT_END = "app.contodo.DX_END";
+    private static final long CHECK_EVERY = 20L * 60000L;
+
+    private Nudge() { }
+
+    static void saveConfig(Context c, String json) {
+        W.p(c).edit().putString("dxcfg", json).apply();
+    }
+
+    static JSONObject cfg(Context c) {
+        try {
+            return new JSONObject(W.p(c).getString("dxcfg", "{}"));
+        } catch (Exception e) {
+            return new JSONObject();
+        }
+    }
+
+    private static PendingIntent pi(Context c, String action, int rc, int min) {
+        Intent i = new Intent(c, DetoxReceiver.class);
+        i.setAction(action);
+        if (min > 0) i.putExtra("min", min);
+        return PendingIntent.getBroadcast(c, rc, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    private static void setAt(Context c, long at, PendingIntent pi, boolean exact) {
+        AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) return;
+        try {
+            if (exact && !(Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms())) {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+            } else {
+                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+            }
+        } catch (SecurityException e) {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+        }
+    }
+
+    private static void cancel(Context c, PendingIntent pi) {
+        AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+        if (am != null) am.cancel(pi);
+    }
+
+    static void armAll(Context c) {
+        arm(c);
+        armBed(c);
+    }
+
+    // 画面時間の見守り：20分ごとに確かめる（許可がない・目標が0・オフのときは予約しない）
+    static void arm(Context c) {
+        JSONObject cfg = cfg(c);
+        PendingIntent p = pi(c, ACT_CHECK, 200, 0);
+        if (cfg.optInt("goal", 0) > 0 && cfg.optBoolean("nudge", true) && Usage.hasAccess(c)) {
+            setAt(c, System.currentTimeMillis() + CHECK_EVERY, p, false);
+        } else {
+            cancel(c, p);
+        }
+    }
+
+    static void check(Context c, boolean force) {
+        JSONObject cfg = cfg(c);
+        int goal = cfg.optInt("goal", 0);
+        if (!force && (goal <= 0 || !cfg.optBoolean("nudge", true) || !Usage.hasAccess(c))) return;
+        Calendar now = Calendar.getInstance();
+        if (!force && now.get(Calendar.HOUR_OF_DAY) < 6) return;   // 夜中は知らせない
+        long min = Usage.todayMinutes(c);
+        int level = goal > 0 && min >= goal ? 2 : (goal > 0 && min >= goal * 0.8 ? 1 : 0);
+        if (force && level == 0) level = 1;
+        String key = "dx_sent_" + W.key(now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, now.get(Calendar.DAY_OF_MONTH));
+        SharedPreferences p = W.p(c);
+        int sent = p.getInt(key, 0);
+        if (level > sent || force) {
+            p.edit().putInt(key, Math.max(level, sent)).apply();
+            Notifier.showUsage(c, level, min, goal > 0 ? goal : 60);
+        }
+    }
+
+    // 寝る前のお知らせ：次にその時刻が来るときに鳴らす
+    static void armBed(Context c) {
+        JSONObject cfg = cfg(c);
+        PendingIntent p = pi(c, ACT_BED, 201, 0);
+        if (!cfg.optBoolean("bedOn", false)) {
+            cancel(c, p);
+            return;
+        }
+        int h = 23;
+        int m = 0;
+        try {
+            String[] hm = cfg.optString("bed", "23:00").split(":");
+            h = Integer.parseInt(hm[0].trim());
+            m = Integer.parseInt(hm[1].trim());
+        } catch (Exception e) {
+            // 読めなければ 23:00
+        }
+        Calendar t = Calendar.getInstance();
+        t.set(Calendar.HOUR_OF_DAY, h);
+        t.set(Calendar.MINUTE, m);
+        t.set(Calendar.SECOND, 0);
+        t.set(Calendar.MILLISECOND, 0);
+        if (t.getTimeInMillis() <= System.currentTimeMillis() + 1000) t.add(Calendar.DAY_OF_MONTH, 1);
+        setAt(c, t.getTimeInMillis(), p, true);
+    }
+
+    static void bedtime(Context c) {
+        Notifier.showBedtime(c);
+    }
+
+    // 「置く」の終わりの通知
+    static void sessionStart(Context c, long endAt, int min) {
+        if (endAt > System.currentTimeMillis()) setAt(c, endAt, pi(c, ACT_END, 210, min), true);
+    }
+
+    static void sessionCancel(Context c) {
+        cancel(c, pi(c, ACT_END, 210, 0));
+    }
+}
+""")
+
+w(PKG_DIR + "/DetoxReceiver.java", r"""package app.contodo;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+public class DetoxReceiver extends BroadcastReceiver {
+    @Override
+    public void onReceive(Context c, Intent i) {
+        String a = i.getAction();
+        if (a == null) return;
+        if (a.equals(Nudge.ACT_CHECK)) {
+            Nudge.check(c, false);
+            Nudge.arm(c);
+            Widgets.updateAll(c);
+        } else if (a.equals(Nudge.ACT_BED)) {
+            Nudge.bedtime(c);
+            Nudge.armBed(c);
+        } else if (a.equals(Nudge.ACT_END)) {
+            // アプリを開いている間は、アプリ自身が結果を見せる
+            if (!MainActivity.foreground) Notifier.showDetoxEnd(c, i.getIntExtra("min", 0));
+        }
+    }
+}
+""")
+
+w(PKG_DIR + "/BootReceiver.java", r"""package app.contodo;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+// 端末の再起動や、アプリの更新で消えるアラームを付け直す
+public class BootReceiver extends BroadcastReceiver {
+    @Override
+    public void onReceive(Context c, Intent i) {
+        String a = i.getAction();
+        if (Intent.ACTION_BOOT_COMPLETED.equals(a) || Intent.ACTION_MY_PACKAGE_REPLACED.equals(a)) {
+            Nudge.armAll(c);
+            Widgets.updateAll(c);
+        }
+    }
+}
+""")
+
+w(PKG_DIR + "/DetoxWidget.java", r"""package app.contodo;
+
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProvider;
+import android.content.Context;
+import android.text.SpannableStringBuilder;
+import android.view.View;
+import android.widget.RemoteViews;
+
+import org.json.JSONObject;
+
+import java.util.Calendar;
+import java.util.List;
+
+// 画面時間：今日の画面時間、目標との比較、よく使ったアプリ、置けた時間。色は ConTodo のテーマに合わせる
+public class DetoxWidget extends AppWidgetProvider {
+    @Override
+    public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        render(c, m, ids);
+    }
+
+    // 動作確認用：いまの集計を1行で返す
+    static String describe(Context c) {
+        Usage.Result r = Usage.compute(c, 1);
+        return "min=" + r.todayMin() + " pickups=" + (r.pickupsOk ? r.pickups[0] : -1);
+    }
+
+    static void render(Context c, AppWidgetManager m, int[] ids) {
+        if (ids == null || ids.length == 0) return;
+        JSONObject snap = W.snap(c);
+        JSONObject th = W.theme(snap);
+        int bg = W.col(th, "bg", 0xFFF5F6F5);
+        int ink = W.col(th, "ink", 0xFF1D2120);
+        int ink2 = W.col(th, "ink2", 0xFF6B716E);
+        int ink3 = W.col(th, "ink3", 0xFFA2A7A4);
+        int accent = W.col(th, "accent", 0xFF2F4B6E);
+        int danger = W.col(th, "sun", 0xFFA5473A);
+
+        JSONObject dx = snap.optJSONObject("detox");
+        Calendar cal = Calendar.getInstance();
+        String todayKey = W.key(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH));
+        boolean fresh = dx != null && todayKey.equals(snap.optString("todayKey"));
+        int placed = fresh ? dx.optInt("placed") : 0;
+        int streak = dx != null ? dx.optInt("streak") : 0;
+        int goal = Nudge.cfg(c).optInt("goal", dx != null ? dx.optInt("goal", 0) : 0);
+
+        RemoteViews v = new RemoteViews(c.getPackageName(), R.layout.widget_card);
+        v.setImageViewResource(R.id.bg, R.drawable.w_round);
+        v.setInt(R.id.bg, "setColorFilter", bg);
+        v.setTextViewText(R.id.w_label, "画面時間");
+        v.setTextColor(R.id.w_label, ink3);
+        v.setTextViewText(R.id.w_right, streak > 0 ? "置けた連続 " + streak + "日" : "");
+        v.setTextColor(R.id.w_right, ink3);
+        v.setOnClickPendingIntent(R.id.root, W.open(c, "usage", 51));
+        v.setOnClickPendingIntent(R.id.w_foot, W.open(c, "detox", 52));
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        if (!Usage.hasAccess(c)) {
+            v.setViewVisibility(R.id.w_bigrow, View.GONE);
+            sb.append("タップして「使用状況へのアクセス」を許可すると、今日の画面時間が出ます。");
+            Card.color(sb, 0, ink2);
+            v.setTextViewText(R.id.w_foot, "置けた " + placed + "分 ・ ＋ 置く");
+        } else {
+            Usage.Result r = Usage.compute(c, 1);
+            long min = r.todayMin();
+            boolean over = goal > 0 && min > goal;
+            v.setViewVisibility(R.id.w_bigrow, View.VISIBLE);
+            v.setTextViewText(R.id.w_big, Usage.dur(min));
+            v.setTextColor(R.id.w_big, over ? danger : ink);
+            v.setTextViewText(R.id.w_unit, goal > 0 ? "/ 目標 " + Usage.dur(goal) : "");
+            v.setTextColor(R.id.w_unit, ink3);
+            if (goal > 0) {
+                int cells = 10;
+                int filled = (int) Math.min(cells, Math.round(cells * min / (double) goal));
+                StringBuilder bar = new StringBuilder();
+                for (int k = 0; k < cells; k++) bar.append(k < filled ? "▰" : "▱");
+                int a = sb.length();
+                sb.append(bar).append("  ").append(String.valueOf(Math.min(999, Math.round(100.0 * min / goal)))).append("%");
+                Card.color(sb, a, over ? danger : accent);
+            }
+            List<Object[]> top = Usage.top(c, r, 3);
+            for (Object[] t : top) {
+                if (sb.length() > 0) sb.append("\n");
+                int a = sb.length();
+                sb.append("● ");
+                Card.color(sb, a, ink3);
+                int b = sb.length();
+                sb.append((String) t[0]).append("  ").append(Usage.dur((Long) t[1]));
+                Card.color(sb, b, ink);
+            }
+            if (sb.length() == 0) {
+                sb.append("今日はまだ、ほとんど使っていません。");
+                Card.color(sb, 0, ink2);
+            }
+            v.setTextViewText(R.id.w_foot, (r.pickupsOk ? "点けた " + r.pickups[0] + "回 ・ " : "") + "置けた " + placed + "分 ・ ＋ 置く");
+        }
+        v.setTextViewText(R.id.w_body, sb);
+        v.setTextColor(R.id.w_body, ink);
+        v.setTextColor(R.id.w_foot, accent);
+        m.updateAppWidget(ids, v);
+    }
+}
+""")
+
+# 動作確認用：エミュレータで「intent extra: selftest」を付けて起動すると、画面時間の集計・予約・通知を一通り動かしてログに出す
+w(PKG_DIR + "/Selftest.java", r"""package app.contodo;
+
+import android.content.Context;
+import android.util.Log;
+
+final class Selftest {
+    private Selftest() { }
+
+    static void run(Context c) {
+        final String t = "ConTodo";
+        try {
+            Log.i(t, "SELFTEST start access=" + Usage.hasAccess(c));
+            Log.i(t, "SELFTEST summary=" + Usage.summary(c));
+            long now = System.currentTimeMillis();
+            Log.i(t, "SELFTEST pickups=" + Usage.pickups(c, now - 3600000L, now));
+            Nudge.saveConfig(c, "{\"goal\":1,\"nudge\":true,\"bedOn\":true,\"bed\":\"23:59\"}");
+            Nudge.armAll(c);
+            Nudge.check(c, true);
+            Notifier.showBedtime(c);
+            Notifier.showDetoxEnd(c, 30);
+            Nudge.sessionStart(c, now + 600000L, 10);
+            Log.i(t, "SELFTEST widget " + DetoxWidget.describe(c));
+            Widgets.updateAll(c);
+            Log.i(t, "SELFTEST done");
+        } catch (Throwable e) {
+            Log.e(t, "SELFTEST failed", e);
+        }
+    }
+}
+""")
+
 # ---------------------------------------------------------------- res
 w(RES + "/values/strings.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 <resources>
@@ -1408,6 +2158,7 @@ w(RES + "/values/strings.xml", r"""<?xml version="1.0" encoding="utf-8"?>
     <string name="widget_tasks_desc">残っているタスクと次の一歩（半透明）</string>
     <string name="widget_focus_desc">今日の集中時間と連続日数（半透明）</string>
     <string name="widget_money_desc">今月の支出と予算の残り</string>
+    <string name="widget_detox_desc">今日の画面時間と、置けた時間</string>
 </resources>
 """)
 
@@ -1534,6 +2285,7 @@ widget_info("timeline", "timeline", 250, 110, 4, 3)
 widget_info("tasks", "tasks", 180, 110, 3, 3)
 widget_info("focus", "focus", 110, 110, 2, 2)
 widget_info("money", "money", 180, 110, 3, 2)
+widget_info("detox", "detox", 180, 180, 3, 3)
 
 w(RES + "/layout/widget_card.xml", r"""<?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -1869,18 +2621,34 @@ APK=app/build/outputs/apk/release/app-release.apk
   echo "install exit: $?"
   adb shell pm list packages | grep contodo
   adb shell dumpsys package app.contodo | grep -E "versionName|versionCode|targetSdk|minSdk|flags=|signatures|Signing" | head -12
+  # 通知の許可と「使用状況へのアクセス」を、設定画面を通さずに与える（実機ではユーザーが設定で許可する）
+  adb shell pm grant app.contodo android.permission.POST_NOTIFICATIONS 2>&1
+  adb shell appops set app.contodo GET_USAGE_STATS allow 2>&1
+  adb shell appops get app.contodo GET_USAGE_STATS 2>&1
   echo "=== launch ==="
   adb shell monkey -p app.contodo -c android.intent.category.LAUNCHER 1 2>&1
 } > emu.log 2>&1
 sleep 30
 adb exec-out screencap -p > shot-app.png
+# 画面時間の画面（記録 → デトックス）を、本物のWebViewで開く
+adb shell am start -n app.contodo/.MainActivity --es action usage > /dev/null 2>&1
+sleep 20
+adb exec-out screencap -p > shot-usage.png
+# 画面時間の集計・予約・通知を一通り動かす（Selftest）
+adb shell am start -n app.contodo/.MainActivity --es selftest 1 > /dev/null 2>&1
+sleep 10
 {
   echo "=== resumed activity ==="
   adb shell dumpsys activity activities | grep -iE "mResumedActivity|topResumedActivity" | head -3
   echo "=== widgets registered ==="
-  adb shell dumpsys appwidget | grep -iE "contodo" | head -8
+  adb shell dumpsys appwidget | grep -iE "contodo" | head -10
+  echo "=== notifications ==="
+  adb shell dumpsys notification --noredact | grep -E "pkg=app.contodo|android.title=|android.text=" | head -20
+  echo "=== alarms ==="
+  adb shell dumpsys alarm | grep -iE "app\.contodo" | head -20
 } >> emu.log 2>&1
-adb logcat -d | grep -iE "AndroidRuntime|FATAL|app\.contodo|ConTodo|chromium.*(ERROR|Uncaught)" | tail -80 > crash.log
+adb logcat -d -s ConTodo:V > detox.log 2>&1
+adb logcat -d | grep -iE "AndroidRuntime|FATAL|app\.contodo|ConTodo|chromium.*(ERROR|Uncaught)" | tail -120 > crash.log
 echo "emulator test done"
 """)
 
