@@ -87,7 +87,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           files=""
-          for f in build.log emu.log crash.log shot-app.png; do
+          for f in build.log emu.log crash.log detox.log shot-app.png shot-usage.png; do
             if [ -f "$f" ]; then files="$files $f"; fi
           done
           gh release delete buildlog --yes --cleanup-tag || true
