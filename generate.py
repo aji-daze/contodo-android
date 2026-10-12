@@ -635,7 +635,8 @@ public class MainActivity extends Activity {
             }
         });
 
-        String action = clean(getIntent().getStringExtra("action"));
+        // プロセス破棄からの復帰（b != null）では、起動時の action を再実行しない
+        String action = b == null ? clean(getIntent().getStringExtra("action")) : "";
         web.loadUrl(BASE + (action.isEmpty() ? "" : "?action=" + action));
 
         if (Build.VERSION.SDK_INT >= 33
