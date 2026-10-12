@@ -42,7 +42,7 @@ w("build.gradle", r"""plugins {
 """)
 
 w("gradle.properties", r"""org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
-android.useAndroidX=false
+android.useAndroidX=true
 """)
 
 w("app/build.gradle", r"""plugins {
@@ -91,6 +91,11 @@ android {
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
 }
+
+dependencies {
+    // レシートの文字を、端末の中で読む（日本語。モデルはアプリに同梱するので、ネットにつながなくても動く）
+    implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
+}
 """)
 
 # ---------------------------------------------------------------- manifest
@@ -115,6 +120,10 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.HOME" />
+        </intent>
+        <!-- レシートを撮るカメラ -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
         </intent>
     </queries>
 
@@ -562,7 +571,10 @@ public class MainActivity extends Activity {
     static final int REQ_FILE = 1;
     static final int REQ_SAVE = 2;
     static final int REQ_NOTIF = 3;
+    static final int REQ_CAM = 4;
+    static final int REQ_PICK = 5;
     static volatile boolean foreground = false;
+    private Uri camUri;
 
     private WebView web;
     private ValueCallback<Uri[]> chooser;
@@ -707,6 +719,98 @@ public class MainActivity extends Activity {
                 }
             }
             pendingContent = null;
+        } else if (req == REQ_CAM) {
+            // カメラで撮ったレシート。読み取りのあと、撮った写真は消す（端末に残さない）
+            String saved = W.p(this).getString("camUri", "");
+            final Uri u = camUri != null ? camUri : (saved.isEmpty() ? null : Uri.parse(saved));
+            camUri = null;
+            W.p(this).edit().remove("camUri").apply();
+            if (u == null) return;
+            if (res == RESULT_OK) {
+                js("window.__receiptStatus&&window.__receiptStatus('reading')");
+                Scan.fromUri(this, u, new Scan.Done() {
+                    @Override
+                    public void on(String json) {
+                        deliver(json);
+                        try {
+                            getContentResolver().delete(u, null, null);
+                        } catch (Exception e) {
+                            // 消せなくても、読み取りの結果には影響しない
+                        }
+                    }
+                });
+            } else {
+                try {
+                    getContentResolver().delete(u, null, null);   // 撮らなかったときは、用意した空の写真を消す
+                } catch (Exception e) {
+                    // 消せなくても問題ない
+                }
+            }
+        } else if (req == REQ_PICK) {
+            if (res == RESULT_OK && data != null && data.getData() != null) {
+                js("window.__receiptStatus&&window.__receiptStatus('reading')");
+                Scan.fromUri(this, data.getData(), new Scan.Done() {
+                    @Override
+                    public void on(String json) {
+                        deliver(json);
+                    }
+                });
+            }
+        }
+    }
+
+    // ページの JavaScript を実行する（どのスレッドからでも呼べる）
+    void js(final String code) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (web != null) web.evaluateJavascript(code, null);
+            }
+        });
+    }
+
+    // レシートの読み取り結果をページへ渡す
+    void deliver(String json) {
+        js("window.__receiptScanned&&window.__receiptScanned(" + JSONObject.quote(json) + ")");
+    }
+
+    // レシートを撮る（camera）か、写真から選ぶ（pick）。カメラが使えないときは写真から選ぶ
+    void startScan(String mode) {
+        if ("camera".equals(mode) && Build.VERSION.SDK_INT >= 29) {
+            Uri u = null;
+            try {
+                android.content.ContentValues cv = new android.content.ContentValues();
+                cv.put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "contodo-receipt-" + System.currentTimeMillis() + ".jpg");
+                cv.put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                cv.put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ConTodo");
+                u = getContentResolver().insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                if (u != null) {
+                    camUri = u;
+                    W.p(this).edit().putString("camUri", u.toString()).apply();
+                    Intent i = new Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE);
+                    i.putExtra(android.provider.MediaStore.EXTRA_OUTPUT, u);
+                    i.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(i, REQ_CAM);
+                    return;
+                }
+            } catch (Exception e) {
+                if (u != null) {
+                    try {
+                        getContentResolver().delete(u, null, null);
+                    } catch (Exception e2) {
+                        // 後始末できなくても先へ進む
+                    }
+                }
+                camUri = null;
+            }
+        }
+        try {
+            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("image/*");
+            startActivityForResult(Intent.createChooser(i, "レシートの写真を選ぶ"), REQ_PICK);
+        } catch (Exception e) {
+            deliver(Scan.fail("写真を選ぶ画面を開けませんでした。"));
         }
     }
 
@@ -779,6 +883,17 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void saveBackup(final String name, final String json) {
             startSave(name, "application/json", json);
+        }
+
+        // レシートを撮る（camera）／写真から選ぶ（pick）。結果は window.__receiptScanned に届く
+        @JavascriptInterface
+        public void scanReceipt(final String mode) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    startScan(mode);
+                }
+            });
         }
 
         // ---- デジタルデトックス ----
@@ -2035,6 +2150,89 @@ final class Nudge {
 }
 """)
 
+# レシートの文字認識。写真は端末の中で読み、「行（文字と位置）」だけをページに返す。
+# 品名・金額・日付への整理はページ側（JavaScript）で行う
+w(PKG_DIR + "/Scan.java", r"""package app.contodo;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.net.Uri;
+
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+final class Scan {
+    interface Done {
+        void on(String json);
+    }
+
+    private Scan() { }
+
+    static String fail(String msg) {
+        try {
+            return new JSONObject().put("ok", false).put("error", msg).toString();
+        } catch (Exception e) {
+            return "{\"ok\":false}";
+        }
+    }
+
+    static void fromUri(Context c, Uri uri, Done done) {
+        try {
+            run(InputImage.fromFilePath(c, uri), done);
+        } catch (Exception e) {
+            done.on(fail("写真を開けませんでした。"));
+        }
+    }
+
+    static void fromBitmap(Bitmap b, Done done) {
+        run(InputImage.fromBitmap(b, 0), done);
+    }
+
+    private static void run(final InputImage img, final Done done) {
+        final TextRecognizer rec = TextRecognition.getClient(new JapaneseTextRecognizerOptions.Builder().build());
+        rec.process(img)
+                .addOnSuccessListener(text -> {
+                    try {
+                        done.on(toJson(text, img.getWidth(), img.getHeight()));
+                    } finally {
+                        rec.close();
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    try {
+                        done.on(fail("読み取りに失敗しました。もう一度試してください。"));
+                    } finally {
+                        rec.close();
+                    }
+                });
+    }
+
+    static String toJson(Text text, int w, int h) {
+        try {
+            JSONArray lines = new JSONArray();
+            for (Text.TextBlock b : text.getTextBlocks()) {
+                for (Text.Line l : b.getLines()) {
+                    Rect r = l.getBoundingBox();
+                    if (r == null) continue;
+                    lines.put(new JSONObject().put("t", l.getText()).put("x", r.left).put("y", r.top)
+                            .put("w", r.width()).put("h", r.height()));
+                }
+            }
+            return new JSONObject().put("ok", true).put("w", w).put("h", h).put("lines", lines).toString();
+        } catch (Exception e) {
+            return fail("読み取り結果を整えられませんでした。");
+        }
+    }
+}
+""")
+
 w(PKG_DIR + "/DetoxReceiver.java", r"""package app.contodo;
 
 import android.content.BroadcastReceiver;
@@ -2190,6 +2388,8 @@ w(PKG_DIR + "/Selftest.java", r"""package app.contodo;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -2263,6 +2463,43 @@ final class Selftest {
         if (err[0] != null) throw err[0];
     }
 
+    // レシートの絵（品名は左、金額は右）を描いて、日本語の文字認識にかける。返ってきた「行」をログに出す
+    private static void ocr(Context c) throws Exception {
+        String[][] rows = {
+                {"まいばすけっと 西新宿店", ""}, {"TEL 03-1234-5678", ""}, {"2026年10月11日(日) 18:42", ""}, {"領収書", ""},
+                {"牛乳 1000ml", "¥235"}, {"食パン 6枚", "¥178"}, {"バナナ", "¥162"}, {"値引", "-30"},
+                {"小計", "¥545"}, {"(内消費税 8%)", "¥40"}, {"合計", "¥545"}, {"お預り", "¥1,000"}, {"お釣り", "¥455"}};
+        Bitmap bmp = Bitmap.createBitmap(800, 60 + rows.length * 56 + 40, Bitmap.Config.ARGB_8888);
+        Canvas cv = new Canvas(bmp);
+        cv.drawColor(Color.WHITE);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(Color.BLACK);
+        p.setTextSize(36);
+        for (int i = 0; i < rows.length; i++) {
+            float y = 70 + i * 56;
+            p.setTextAlign(Paint.Align.LEFT);
+            cv.drawText(rows[i][0], 40, y, p);
+            if (!rows[i][1].isEmpty()) {
+                p.setTextAlign(Paint.Align.RIGHT);
+                cv.drawText(rows[i][1], 760, y, p);
+            }
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String[] result = new String[1];
+        Scan.fromBitmap(bmp, new Scan.Done() {
+            @Override
+            public void on(String json) {
+                result[0] = json;
+                latch.countDown();
+            }
+        });
+        if (!latch.await(90, TimeUnit.SECONDS)) throw new Exception("ocr timeout");
+        String json = result[0];
+        for (int i = 0; i < json.length(); i += 3000) {
+            Log.i("ConTodo", "SELFTEST ocr[" + (i / 3000) + "]=" + json.substring(i, Math.min(json.length(), i + 3000)));
+        }
+    }
+
     private static void save(View v, int w, int h, File f) throws Exception {
         v.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY));
@@ -2283,6 +2520,12 @@ final class Selftest {
             Log.i(t, "SELFTEST shots saved");
         } catch (Throwable e) {
             Log.e(t, "SELFTEST shots failed", e);
+        }
+        try {
+            ocr(c);
+            Log.i(t, "SELFTEST ocr done");
+        } catch (Throwable e) {
+            Log.e(t, "SELFTEST ocr failed", e);
         }
         try {
             Log.i(t, "SELFTEST start access=" + Usage.hasAccess(c));
@@ -2793,7 +3036,7 @@ sleep 20
 adb exec-out screencap -p > shot-usage.png
 # 画面時間の集計・予約・通知を一通り動かす（Selftest）
 adb shell am start -n app.contodo/.MainActivity --es selftest 1 > /dev/null 2>&1
-sleep 10
+sleep 40
 {
   echo "=== resumed activity ==="
   adb shell dumpsys activity activities | grep -iE "mResumedActivity|topResumedActivity" | head -3
