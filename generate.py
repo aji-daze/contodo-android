@@ -887,16 +887,20 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.Resources;
+import android.graphics.Color;
+import android.graphics.Typeface;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
 import android.widget.RemoteViews;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.Calendar;
+import java.util.Iterator;
 
 public class CalendarWidget extends AppWidgetProvider {
     static final String ACT_PREV = "app.contodo.CAL_PREV";
@@ -938,8 +942,25 @@ public class CalendarWidget extends AppWidgetProvider {
         sb.setSpan(new ForegroundColorSpan(color), a, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
     }
 
+    // "10:00–16:00" → "10–16"、"10:30–16:00" → "10:30–16"
+    static String shortRange(String r) {
+        String[] p = r.split("–");
+        if (p.length != 2) return r;
+        return shortTime(p[0]) + "–" + shortTime(p[1]);
+    }
+
+    private static String shortTime(String t) {
+        t = t.trim();
+        return t.endsWith(":00") ? t.substring(0, t.length() - 3) : t;
+    }
+
     static void render(Context c, AppWidgetManager m, int[] ids) {
         if (ids == null || ids.length == 0) return;
+        m.updateAppWidget(ids, build(c));
+    }
+
+    // ウィジェットの中身を作る（動作確認では、これを画像にして見た目を確かめる）
+    static RemoteViews build(Context c) {
         JSONObject snap = W.snap(c);
         JSONObject th = W.theme(snap);
         int bg = W.col(th, "bg", 0xFFF5F6F5);
@@ -990,34 +1011,58 @@ public class CalendarWidget extends AppWidgetProvider {
                 String key = W.key(d.get(Calendar.YEAR), d.get(Calendar.MONTH) + 1, d.get(Calendar.DAY_OF_MONTH));
                 boolean isToday = key.equals(todayKey);
 
+                // シフトの日は、時間（10–16）を出して見分けられるようにする。予定は小さな点
+                JSONObject info = (!out && days != null) ? days.optJSONObject(key) : null;
+                String shiftLabel = null;
+                int shiftColor = 0;
+                int shiftCount = 0;
+                int eventCount = 0;
+                JSONArray dl = info != null ? info.optJSONArray("l") : null;
+                if (dl != null) {
+                    for (int k = 0; k < dl.length(); k++) {
+                        JSONArray it = dl.optJSONArray(k);
+                        if (it == null) continue;
+                        String col = it.optString(2, "");
+                        if (col.length() > 0) {
+                            shiftCount++;
+                            if (shiftLabel == null) {
+                                shiftLabel = shortRange(it.optString(0));
+                                shiftColor = W.parse(col, accent);
+                            }
+                        } else {
+                            eventCount++;
+                        }
+                    }
+                }
+
                 SpannableStringBuilder sb = new SpannableStringBuilder(String.valueOf(d.get(Calendar.DAY_OF_MONTH)));
                 sb.append("\n");
                 int s0 = sb.length();
-                JSONObject info = (!out && days != null) ? days.optJSONObject(key) : null;
-                int n = 0;
-                if (info != null) {
-                    JSONArray sa = info.optJSONArray("s");
-                    if (sa != null) {
-                        for (int k = 0; k < sa.length() && k < 2; k++) {
-                            dot(sb, isToday ? bg : W.parse(sa.optString(k), ink2));
-                            n++;
-                        }
-                    }
-                    if (info.optInt("e", 0) > 0) {
-                        dot(sb, isToday ? bg : ink2);
-                        n++;
-                    }
+                if (shiftLabel != null) {
+                    int a = sb.length();
+                    sb.append(shiftLabel).append(shiftCount > 1 ? "+" : "");
+                    sb.setSpan(new StyleSpan(Typeface.BOLD), a, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    sb.setSpan(new ForegroundColorSpan(isToday ? bg : ink), a, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    if (eventCount > 0) dot(sb, isToday ? bg : ink2);
+                } else if (eventCount > 0) {
+                    dot(sb, isToday ? bg : ink2);
+                } else {
+                    sb.append(" ");
                 }
-                if (n == 0) sb.append(" ");
-                sb.setSpan(new RelativeSizeSpan(0.6f), s0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                sb.setSpan(new RelativeSizeSpan(0.72f), s0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
 
                 int cid = res.getIdentifier("c" + r + cc, "id", pkg);
                 v.setTextViewText(cid, sb);
                 int color = out ? ink3 : (cc == 0 ? sun : (cc == 6 ? sat : ink));
+                // 背景は毎回すべてのマスに指定する（指定しないと、前に塗った色がほかのマスに残る）
+                int cellBg = Color.TRANSPARENT;
                 if (isToday) {
-                    v.setInt(cid, "setBackgroundColor", accent);
+                    cellBg = accent;
                     color = bg;
+                } else if (shiftLabel != null) {
+                    cellBg = (shiftColor & 0x00FFFFFF) | 0x38000000;   // シフトの色を、うすく敷く
                 }
+                v.setInt(cid, "setBackgroundColor", cellBg);
                 v.setTextColor(cid, color);
             }
         }
@@ -1040,11 +1085,34 @@ public class CalendarWidget extends AppWidgetProvider {
             if (items.length() > 3) list.append("\n他 " + (items.length() - 3) + " 件");
         } else {
             list.append("今日の予定はありません");
+            // 今日がなければ、いちばん近い次の予定・シフトを出す
+            String nk = null;
+            if (days != null) {
+                Iterator<String> keys = days.keys();
+                while (keys.hasNext()) {
+                    String k2 = keys.next();
+                    if (k2.compareTo(todayKey) <= 0 || (nk != null && k2.compareTo(nk) >= 0)) continue;
+                    JSONObject dd = days.optJSONObject(k2);
+                    JSONArray l2 = dd != null ? dd.optJSONArray("l") : null;
+                    if (l2 != null && l2.length() > 0) nk = k2;
+                }
+            }
+            if (nk != null) {
+                JSONArray first2 = days.optJSONObject(nk).optJSONArray("l").optJSONArray(0);
+                String[] pr = nk.split("-");
+                Calendar nc = Calendar.getInstance();
+                nc.set(Integer.parseInt(pr[0]), Integer.parseInt(pr[1]) - 1, Integer.parseInt(pr[2]));
+                int a = list.length();
+                list.append("\n次：" + Integer.parseInt(pr[1]) + "/" + Integer.parseInt(pr[2])
+                        + "（" + "日月火水木金土".charAt(nc.get(Calendar.DAY_OF_WEEK) - 1) + "）"
+                        + (first2 != null ? first2.optString(0) + "  " + first2.optString(1) : ""));
+                list.setSpan(new ForegroundColorSpan(ink2), a, list.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
         }
         v.setTextViewText(R.id.cal_list, list);
         v.setTextColor(R.id.cal_list, ink);
 
-        m.updateAppWidget(ids, v);
+        return v;
     }
 }
 """)
@@ -2120,13 +2188,102 @@ public class DetoxWidget extends AppWidgetProvider {
 w(PKG_DIR + "/Selftest.java", r"""package app.contodo;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.RemoteViews;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.util.Calendar;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 final class Selftest {
     private Selftest() { }
 
+    // カレンダーのウィジェットを画像にして保存する。a = 今月、b = 来月。
+    // 同じ View に b を重ねがけして、前に描いた色が残らないことも確かめる（以前はここで青いマスが残った）
+    private static void shots(final Context c) throws Exception {
+        Calendar now = Calendar.getInstance();
+        JSONObject days = new JSONObject();
+        int[] shiftDays = {1, 3, 7, 8, 11, 14, 15, 18, 21, 22, 25, 28};
+        for (int off = 0; off <= 1; off++) {
+            for (int d : shiftDays) {
+                Calendar k = Calendar.getInstance();
+                k.set(Calendar.DAY_OF_MONTH, 1);
+                k.add(Calendar.MONTH, off);
+                k.set(Calendar.DAY_OF_MONTH, d);
+                String range = (d % 7 == 0) ? "10:00–17:00" : "10:00–16:00";
+                days.put(W.key(k.get(Calendar.YEAR), k.get(Calendar.MONTH) + 1, k.get(Calendar.DAY_OF_MONTH)),
+                        new JSONObject().put("s", new JSONArray().put("#4A6A90")).put("e", 0)
+                                .put("l", new JSONArray().put(new JSONArray().put(range).put("カフェ").put("#4A6A90"))));
+            }
+        }
+        String today = W.key(now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, now.get(Calendar.DAY_OF_MONTH));
+        days.put(today, new JSONObject().put("s", new JSONArray().put("#4A6A90")).put("e", 1)
+                .put("l", new JSONArray().put(new JSONArray().put("10:00–16:00").put("カフェ").put("#4A6A90"))
+                        .put(new JSONArray().put("19:00").put("歯医者").put(""))));
+        JSONObject snap = new JSONObject().put("todayKey", today).put("days", days);
+        W.p(c).edit().putString("snap", snap.toString()).putInt("calOff", 0).commit();
+        final RemoteViews a = CalendarWidget.build(c);
+        W.p(c).edit().putInt("calOff", 1).commit();
+        final RemoteViews b = CalendarWidget.build(c);
+        W.p(c).edit().putInt("calOff", 0).commit();
+
+        final CountDownLatch done = new CountDownLatch(1);
+        final Exception[] err = new Exception[1];
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    float dens = c.getResources().getDisplayMetrics().density;
+                    int w = (int) (300 * dens);
+                    int h = (int) (300 * dens);
+                    File dir = c.getExternalFilesDir(null);
+                    View v = a.apply(c, new FrameLayout(c));
+                    save(v, w, h, new File(dir, "cal-a.png"));
+                    b.reapply(c, v);
+                    save(v, w, h, new File(dir, "cal-b.png"));
+                } catch (Exception e) {
+                    err[0] = e;
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        if (!done.await(15, TimeUnit.SECONDS)) throw new Exception("shots timeout");
+        if (err[0] != null) throw err[0];
+    }
+
+    private static void save(View v, int w, int h, File f) throws Exception {
+        v.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY));
+        v.layout(0, 0, w, h);
+        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas cv = new Canvas(bmp);
+        cv.drawColor(0xFF2B3340);
+        v.draw(cv);
+        FileOutputStream os = new FileOutputStream(f);
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+        os.close();
+    }
+
     static void run(Context c) {
         final String t = "ConTodo";
+        try {
+            shots(c);
+            Log.i(t, "SELFTEST shots saved");
+        } catch (Throwable e) {
+            Log.e(t, "SELFTEST shots failed", e);
+        }
         try {
             Log.i(t, "SELFTEST start access=" + Usage.hasAccess(c));
             Log.i(t, "SELFTEST summary=" + Usage.summary(c));
@@ -2648,6 +2805,11 @@ sleep 10
   adb shell dumpsys alarm | grep -iE "app\.contodo" | head -20
 } >> emu.log 2>&1
 adb logcat -d -s ConTodo:V > detox.log 2>&1
+# ウィジェットを描いた画像を取り出す（アプリの外部保存領域）
+adb shell ls -la /sdcard/Android/data/app.contodo/files/ >> emu.log 2>&1
+adb exec-out cat /sdcard/Android/data/app.contodo/files/cal-a.png > cal-a.png 2>/dev/null
+adb exec-out cat /sdcard/Android/data/app.contodo/files/cal-b.png > cal-b.png 2>/dev/null
+ls -la cal-a.png cal-b.png >> emu.log 2>&1
 adb logcat -d | grep -iE "AndroidRuntime|FATAL|app\.contodo|ConTodo|chromium.*(ERROR|Uncaught)" | tail -120 > crash.log
 echo "emulator test done"
 """)
