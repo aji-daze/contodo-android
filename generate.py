@@ -63,10 +63,11 @@ android {
 
     signingConfigs {
         release {
-            storeFile file('../contodo.jks')
-            storePassword 'contodo-key'
+            storeFile file('../signing.p12')
+            storeType 'pkcs12'
+            storePassword System.getenv('SIGNING_PASSWORD')
             keyAlias 'contodo'
-            keyPassword 'contodo-key'
+            keyPassword System.getenv('SIGNING_PASSWORD')
         }
     }
 

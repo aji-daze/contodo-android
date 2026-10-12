@@ -19,19 +19,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 署名用の鍵は最初の1回だけ作り、リポジトリに保存する（更新のたびに同じ鍵で署名するため）
+      # 署名用の鍵は GitHub Secrets から復元する（鍵とパスワードはリポジトリに置かない）
       - name: signing key
-        run: |
-          if [ ! -f contodo.jks ]; then
-            keytool -genkeypair -keystore contodo.jks -alias contodo -keyalg RSA -keysize 2048 \
-              -validity 36500 -storepass contodo-key -keypass contodo-key \
-              -dname "CN=ConTodo, O=ConTodo, C=JP"
-            git config user.name "github-actions"
-            git config user.email "actions@users.noreply.github.com"
-            git add contodo.jks
-            git commit -m "add signing key"
-            git push
-          fi
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: printf '%s' "$SIGNING_KEYSTORE_B64" | base64 -d > signing.p12
 
       - name: generate project
         run: python3 generate.py
@@ -43,6 +35,7 @@ jobs:
       - name: build
         env:
           VERSION_CODE: ${{ github.run_number }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
           set -o pipefail
           gradle --no-daemon assembleRelease 2>&1 | tee build.log
