@@ -247,6 +247,9 @@ w("app/src/main/AndroidManifest.xml", r"""<?xml version="1.0" encoding="utf-8"?>
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.DATE_CHANGED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
             </intent-filter>
         </receiver>
     </application>
@@ -335,13 +338,42 @@ final class W {
 w(PKG_DIR + "/Widgets.java", r"""package app.contodo;
 
 import android.appwidget.AppWidgetManager;
+import android.app.AlarmManager;
+import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
+
+import java.util.Calendar;
 
 final class Widgets {
+    static final String ACT_MIDNIGHT = "app.contodo.MIDNIGHT";
+
     private Widgets() { }
 
+    // 日付が変わった直後に、ウィジェットを描き直す（30分ごとの自動更新だけだと、朝まで前の日のまま残ることがある）
+    static void armMidnight(Context c) {
+        try {
+            AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Calendar t = Calendar.getInstance();
+            t.add(Calendar.DAY_OF_MONTH, 1);
+            t.set(Calendar.HOUR_OF_DAY, 0);
+            t.set(Calendar.MINUTE, 0);
+            t.set(Calendar.SECOND, 10);
+            t.set(Calendar.MILLISECOND, 0);
+            Intent i = new Intent(c, BootReceiver.class);
+            i.setAction(ACT_MIDNIGHT);
+            PendingIntent pi = PendingIntent.getBroadcast(c, 900, i,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t.getTimeInMillis(), pi);
+        } catch (Exception e) {
+            // 予約できなくても、日付変更の通知と30分ごとの更新で追いつく
+        }
+    }
+
     static void updateAll(Context c) {
+        armMidnight(c);
         try {
             AppWidgetManager m = AppWidgetManager.getInstance(c);
             int[] cal = m.getAppWidgetIds(new ComponentName(c, CalendarWidget.class));
@@ -1089,9 +1121,15 @@ public class CalendarWidget extends AppWidgetProvider {
         int sat = W.col(th, "sat", 0xFF2F4B6E);
         JSONObject days = snap.optJSONObject("days");
 
-        int off = W.p(c).getInt("calOff", 0);
+        JSONObject hol = snap.optJSONObject("hol");   // 祝日（ConTodo が日本の祝日を計算して渡す）
         Calendar now = Calendar.getInstance();
         String todayKey = W.key(now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, now.get(Calendar.DAY_OF_MONTH));
+        // 月を送ったままでも、日付が変わったら今月に戻す
+        int off = W.p(c).getInt("calOff", 0);
+        if (!todayKey.equals(W.p(c).getString("calDay", ""))) {
+            off = 0;
+            W.p(c).edit().putString("calDay", todayKey).putInt("calOff", 0).apply();
+        }
         Calendar first = Calendar.getInstance();
         first.set(Calendar.DAY_OF_MONTH, 1);
         first.set(Calendar.HOUR_OF_DAY, 12);
@@ -1170,7 +1208,8 @@ public class CalendarWidget extends AppWidgetProvider {
 
                 int cid = res.getIdentifier("c" + r + cc, "id", pkg);
                 v.setTextViewText(cid, sb);
-                int color = out ? ink3 : (cc == 0 ? sun : (cc == 6 ? sat : ink));
+                boolean isHol = hol != null && hol.has(key);
+                int color = out ? ink3 : ((cc == 0 || isHol) ? sun : (cc == 6 ? sat : ink));
                 // 背景は毎回すべてのマスに指定する（指定しないと、前に塗った色がほかのマスに残る）
                 int cellBg = Color.TRANSPARENT;
                 if (isToday) {
@@ -1188,8 +1227,13 @@ public class CalendarWidget extends AppWidgetProvider {
         SpannableStringBuilder list = new SpannableStringBuilder();
         JSONObject td = days != null ? days.optJSONObject(todayKey) : null;
         JSONArray items = td != null ? td.optJSONArray("l") : null;
+        String holToday = hol != null ? hol.optString(todayKey, "") : "";
+        if (holToday.length() > 0) {
+            list.append("祝日　" + holToday + "\n");
+            list.setSpan(new ForegroundColorSpan(sun), 0, list.length() - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
         if (items != null && items.length() > 0) {
-            int n = Math.min(3, items.length());
+            int n = Math.min(holToday.length() > 0 ? 2 : 3, items.length());
             for (int k = 0; k < n; k++) {
                 JSONArray it = items.optJSONArray(k);
                 if (it == null) continue;
@@ -1199,7 +1243,7 @@ public class CalendarWidget extends AppWidgetProvider {
                 list.append(it.optString(0)).append("  ").append(it.optString(1));
                 if (k < n - 1) list.append("\n");
             }
-            if (items.length() > 3) list.append("\n他 " + (items.length() - 3) + " 件");
+            if (items.length() > n) list.append("\n他 " + (items.length() - n) + " 件");
         } else {
             list.append("今日の予定はありません");
             // 今日がなければ、いちばん近い次の予定・シフトを出す
@@ -2275,6 +2319,10 @@ public class BootReceiver extends BroadcastReceiver {
         if (Intent.ACTION_BOOT_COMPLETED.equals(a) || Intent.ACTION_MY_PACKAGE_REPLACED.equals(a)) {
             Nudge.armAll(c);
             Widgets.updateAll(c);
+        } else if (Widgets.ACT_MIDNIGHT.equals(a) || Intent.ACTION_DATE_CHANGED.equals(a)
+                || Intent.ACTION_TIME_CHANGED.equals(a) || Intent.ACTION_TIMEZONE_CHANGED.equals(a)) {
+            // 日付や時刻が変わった。ウィジェットを今日に合わせる
+            Widgets.updateAll(c);
         }
     }
 }
@@ -2433,11 +2481,19 @@ final class Selftest {
         days.put(today, new JSONObject().put("s", new JSONArray().put("#4A6A90")).put("e", 1)
                 .put("l", new JSONArray().put(new JSONArray().put("10:00–16:00").put("カフェ").put("#4A6A90"))
                         .put(new JSONArray().put("19:00").put("歯医者").put(""))));
-        JSONObject snap = new JSONObject().put("todayKey", today).put("days", days);
-        W.p(c).edit().putString("snap", snap.toString()).putInt("calOff", 0).commit();
+        // 祝日（赤字と「祝日」行の確認用）。今日と、今月の5日・12日を祝日にしてみる
+        JSONObject hol = new JSONObject().put(today, "テスト祝日")
+                .put(W.key(now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, 5), "祝日A")
+                .put(W.key(now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1, 12), "祝日B");
+        JSONObject snap = new JSONObject().put("todayKey", today).put("days", days).put("hol", hol);
+        W.p(c).edit().putString("snap", snap.toString()).putInt("calOff", 0).putString("calDay", today).commit();
         final RemoteViews a = CalendarWidget.build(c);
         W.p(c).edit().putInt("calOff", 1).commit();
         final RemoteViews b = CalendarWidget.build(c);
+        // 日付が変わったとき、月送りが今月に戻ること
+        W.p(c).edit().putInt("calOff", 1).putString("calDay", "2000-01-01").commit();
+        CalendarWidget.build(c);
+        Log.i("ConTodo", "SELFTEST calreset off=" + W.p(c).getInt("calOff", -1) + " day=" + W.p(c).getString("calDay", ""));
         W.p(c).edit().putInt("calOff", 0).commit();
 
         final CountDownLatch done = new CountDownLatch(1);
