@@ -781,16 +781,47 @@ public class MainActivity extends Activity {
                 }
             }
         } else if (req == REQ_PICK) {
-            if (res == RESULT_OK && data != null && data.getData() != null) {
-                js("window.__receiptStatus&&window.__receiptStatus('reading')");
-                Scan.fromUri(this, data.getData(), new Scan.Done() {
-                    @Override
-                    public void on(String json) {
-                        deliver(json);
+            if (res == RESULT_OK && data != null) {
+                java.util.ArrayList<Uri> us = new java.util.ArrayList<>();
+                if (data.getClipData() != null) {
+                    for (int k = 0; k < data.getClipData().getItemCount() && k < 60; k++) {
+                        Uri x = data.getClipData().getItemAt(k).getUri();
+                        if (x != null) us.add(x);
                     }
-                });
+                } else if (data.getData() != null) {
+                    us.add(data.getData());
+                }
+                if (us.size() == 1) {
+                    js("window.__receiptStatus&&window.__receiptStatus('reading')");
+                    Scan.fromUriAuto(this, us.get(0), new Scan.Done() {
+                        @Override
+                        public void on(String json) {
+                            deliver(json);
+                        }
+                    });
+                } else if (us.size() > 1) {
+                    js("window.__receiptBatch&&window.__receiptBatch('start'," + us.size() + ",null)");
+                    scanNext(us, 0);
+                }
             }
         }
+    }
+
+    // 選んだ写真を1枚ずつ読み取り、できたものから順にページへ渡す（終わりは 'end'）
+    private void scanNext(final java.util.ArrayList<Uri> us, final int i) {
+        final int n = us.size();
+        if (i >= n) {
+            js("window.__receiptBatch&&window.__receiptBatch('end'," + n + ",null)");
+            return;
+        }
+        js("window.__receiptBatch&&window.__receiptBatch('progress'," + (i + 1) + "," + n + ")");
+        Scan.fromUriAuto(this, us.get(i), new Scan.Done() {
+            @Override
+            public void on(String json) {
+                js("window.__receiptBatch&&window.__receiptBatch('item'," + i + "," + JSONObject.quote(json) + ")");
+                scanNext(us, i + 1);
+            }
+        });
     }
 
     // ページの JavaScript を実行する（どのスレッドからでも呼べる）
@@ -842,7 +873,8 @@ public class MainActivity extends Activity {
             Intent i = new Intent(Intent.ACTION_GET_CONTENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("image/*");
-            startActivityForResult(Intent.createChooser(i, "レシートの写真を選ぶ"), REQ_PICK);
+            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);   // 複数枚をまとめて選べる
+            startActivityForResult(Intent.createChooser(i, "レシートの写真を選ぶ（複数選べます）"), REQ_PICK);
         } catch (Exception e) {
             deliver(Scan.fail("写真を選ぶ画面を開けませんでした。"));
         }
@@ -2202,8 +2234,13 @@ w(PKG_DIR + "/Scan.java", r"""package app.contodo;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.graphics.Rect;
+import android.media.ExifInterface;
 import android.net.Uri;
+
+import java.io.InputStream;
 
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.Text;
@@ -2239,6 +2276,100 @@ final class Scan {
 
     static void fromBitmap(Bitmap b, Done done) {
         run(InputImage.fromBitmap(b, 0), done);
+    }
+
+    // 写真から選んだレシート用。端末の向き情報で起こしたあと、読めなければ横向き・逆さまも試す
+    // （横向きに撮ったレシートは、そのままだと文字認識がほとんど読めない）
+    static void fromUriAuto(Context c, Uri uri, Done done) {
+        Bitmap bmp;
+        try {
+            bmp = load(c, uri);
+        } catch (Throwable e) {
+            done.on(fail("写真を開けませんでした。"));
+            return;
+        }
+        tryRot(bmp, new int[]{0, 90, 270, 180}, 0, null, -1, done);
+    }
+
+    // 長辺が約2600pxになるよう縮めて読み込み、EXIF の向きを直す
+    private static Bitmap load(Context c, Uri uri) throws Exception {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        InputStream in = c.getContentResolver().openInputStream(uri);
+        BitmapFactory.decodeStream(in, null, o);
+        if (in != null) in.close();
+        int max = Math.max(o.outWidth, o.outHeight), ss = 1;
+        while (max / ss > 2600) ss *= 2;
+        o = new BitmapFactory.Options();
+        o.inSampleSize = ss;
+        in = c.getContentResolver().openInputStream(uri);
+        Bitmap b = BitmapFactory.decodeStream(in, null, o);
+        if (in != null) in.close();
+        if (b == null) throw new Exception("decode");
+        int deg = 0;
+        try {
+            in = c.getContentResolver().openInputStream(uri);
+            int ori = new ExifInterface(in).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+            if (in != null) in.close();
+            if (ori == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
+            else if (ori == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
+            else if (ori == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
+        } catch (Throwable e) {
+            deg = 0;
+        }
+        if (deg != 0) {
+            Matrix m = new Matrix();
+            m.postRotate(deg);
+            b = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
+        }
+        return b;
+    }
+
+    // レシートらしさ：合計・小計・領収・税などの語が多いほど高い。金額らしい行も少し数える
+    static int score(Text t) {
+        int s = 0;
+        for (Text.TextBlock b : t.getTextBlocks()) {
+            for (Text.Line l : b.getLines()) {
+                String x = l.getText();
+                if (x.matches(".*(合計|小計|領収|お預|お釣|税|点数|TEL|電話|登録番号).*")) s += 3;
+                else if (x.matches(".*[¥￥]\\s*[0-9,]+.*") || x.matches(".*[0-9,]+円.*")) s += 1;
+            }
+        }
+        return s;
+    }
+
+    private static void tryRot(final Bitmap bmp, final int[] rots, final int i, final String bestJson, final int bestScore, final Done done) {
+        final int rot = rots[i];
+        final InputImage img = InputImage.fromBitmap(bmp, rot);
+        final TextRecognizer rec = TextRecognition.getClient(new JapaneseTextRecognizerOptions.Builder().build());
+        rec.process(img)
+                .addOnSuccessListener(text -> {
+                    int sc = score(text);
+                    boolean side = rot % 180 != 0;
+                    String json = toJson(text, side ? bmp.getHeight() : bmp.getWidth(), side ? bmp.getWidth() : bmp.getHeight());
+                    String bj = bestJson;
+                    int bs = bestScore;
+                    if (sc > bs) {
+                        bj = json;
+                        bs = sc;
+                    }
+                    rec.close();
+                    if (bs >= 6 || i + 1 >= rots.length) {
+                        bmp.recycle();
+                        done.on(bj != null ? bj : json);
+                    } else {
+                        tryRot(bmp, rots, i + 1, bj, bs, done);
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    rec.close();
+                    if (i + 1 < rots.length) {
+                        tryRot(bmp, rots, i + 1, bestJson, bestScore, done);
+                    } else {
+                        bmp.recycle();
+                        done.on(bestJson != null ? bestJson : fail("読み取りに失敗しました。もう一度試してください。"));
+                    }
+                });
     }
 
     private static void run(final InputImage img, final Done done) {
@@ -2555,6 +2686,30 @@ final class Selftest {
         String json = result[0];
         for (int i = 0; i < json.length(); i += 3000) {
             Log.i("ConTodo", "SELFTEST ocr[" + (i / 3000) + "]=" + json.substring(i, Math.min(json.length(), i + 3000)));
+        }
+        // 写真から選ぶ経路（向きの自動判定つき）：そのままの絵と、90度回した絵をファイルにして読み取る
+        for (int deg = 0; deg <= 90; deg += 90) {
+            android.graphics.Matrix m = new android.graphics.Matrix();
+            m.postRotate(deg);
+            Bitmap rb = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+            File f = new File(c.getCacheDir(), "rot" + deg + ".png");
+            FileOutputStream fo = new FileOutputStream(f);
+            rb.compress(Bitmap.CompressFormat.PNG, 100, fo);
+            fo.close();
+            final CountDownLatch l2 = new CountDownLatch(1);
+            final String[] r2 = new String[1];
+            Scan.fromUriAuto(c, android.net.Uri.fromFile(f), new Scan.Done() {
+                @Override
+                public void on(String j) {
+                    r2[0] = j;
+                    l2.countDown();
+                }
+            });
+            if (!l2.await(120, TimeUnit.SECONDS)) throw new Exception("auto timeout");
+            JSONObject o = new JSONObject(r2[0]);
+            int lines = o.optJSONArray("lines") != null ? o.optJSONArray("lines").length() : -1;
+            Log.i("ConTodo", "SELFTEST auto deg=" + deg + " ok=" + o.optBoolean("ok") + " lines=" + lines
+                    + " hasGoukei=" + r2[0].contains("合計"));
         }
     }
 
@@ -3094,7 +3249,7 @@ sleep 20
 adb exec-out screencap -p > shot-usage.png
 # 画面時間の集計・予約・通知を一通り動かす（Selftest）
 adb shell am start -n app.contodo/.MainActivity --es selftest 1 > /dev/null 2>&1
-sleep 40
+sleep 75
 {
   echo "=== resumed activity ==="
   adb shell dumpsys activity activities | grep -iE "mResumedActivity|topResumedActivity" | head -3
