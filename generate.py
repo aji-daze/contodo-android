@@ -951,6 +951,22 @@ public class MainActivity extends Activity {
             startSave(name, "application/json", json);
         }
 
+        // 診断用：読み取りデータを端末のクリップボードにコピーする（チャットに貼り付けて送れる）
+        @JavascriptInterface
+        public void copyText(final String text) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                        if (cm != null) cm.setPrimaryClip(android.content.ClipData.newPlainText("ConTodo", text));
+                    } catch (Exception e) {
+                        // コピーできなくても、アプリは止めない
+                    }
+                }
+            });
+        }
+
         // レシートを撮る（camera）／写真から選ぶ（pick）。結果は window.__receiptScanned に届く
         @JavascriptInterface
         public void scanReceipt(final String mode) {
@@ -2398,8 +2414,12 @@ final class Scan {
                 for (Text.Line l : b.getLines()) {
                     Rect r = l.getBoundingBox();
                     if (r == null) continue;
+                    // 文字の傾き（度）。傾いて撮った写真で、品名と金額の行をそろえるのに使う
+                    double ang = 0;
+                    android.graphics.Point[] cp = l.getCornerPoints();
+                    if (cp != null && cp.length >= 2) ang = Math.toDegrees(Math.atan2(cp[1].y - cp[0].y, cp[1].x - cp[0].x));
                     lines.put(new JSONObject().put("t", l.getText()).put("x", r.left).put("y", r.top)
-                            .put("w", r.width()).put("h", r.height()));
+                            .put("w", r.width()).put("h", r.height()).put("a", Math.round(ang * 10) / 10.0));
                 }
             }
             return new JSONObject().put("ok", true).put("w", w).put("h", h).put("lines", lines).toString();
